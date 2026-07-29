@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Factory Eval Results Viewer</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --panel2: #23262e; --border: #33373f;
+    --text: #e6e8eb; --muted: #9aa0a8; --accent: #4fa3ff;
+    --ok: #3fb96c; --bad: #e05f5f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 14px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  #header-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 16px;
+  }
+  #load-area { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  #addBtn {
+    width: 30px; height: 30px; border-radius: 6px; flex-shrink: 0;
+    border: 1.5px dashed var(--border); background: none; color: var(--muted);
+    cursor: pointer; font-size: 20px; line-height: 1; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  #addBtn:hover, #addBtn.drag { border-color: var(--accent); color: var(--accent); background: var(--panel); }
+  #loadedFiles { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 12px; }
+  #loadedFiles .chip {
+    display: inline-flex; align-items: center;
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 2px 10px; color: var(--text);
+  }
+  #loadedFiles .chip b { color: var(--accent); font-weight: 600; }
+  #loadedFiles .chip .x { cursor: pointer; color: var(--muted); margin-left: 6px; }
+  #loadedFiles .chip .x:hover { color: var(--bad); }
+
+  #filters {
+    display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 16px;
+  }
+  .filter label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .filter select {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; min-width: 160px; font: inherit;
+  }
+  #modelChecks {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; max-height: 130px; overflow-y: auto; min-width: 200px;
+  }
+  #modelChecks label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); text-transform: none; letter-spacing: 0; margin: 2px 0; cursor: pointer; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+  #notice {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 24px; text-align: center; color: var(--muted); margin-bottom: 16px;
+  }
+  .hidden { display: none !important; }
+
+  #cards { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 14px; min-width: 190px; border-top: 3px solid var(--border);
+  }
+  .card .model { font-weight: 600; margin-bottom: 6px; word-break: break-all; }
+  .card .kv { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; }
+  .card .kv span:first-child { color: var(--muted); }
+
+  #charts, .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .chart { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+  .chart svg { width: 100%; display: block; }
+  .bar-label { fill: var(--text); font-size: 12px; }
+  .bar-value { fill: var(--muted); font-size: 11px; }
+  .legend { font-size: 11px; color: var(--muted); margin-top: 6px; display: flex; gap: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+
+  #tableWrap { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
+  th .arrow { font-size: 10px; }
+  td.ok { color: var(--ok); } td.bad { color: var(--bad); }
+  td.msg { max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+
+  /* ── Time filter inputs ──────────────────────────── */
+  .time-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .time-range input[type="datetime-local"] {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font: inherit; color-scheme: dark;
+  }
+  .time-range .sep { color: var(--muted); font-size: 11px; }
+  .time-range .clr {
+    background: none; border: 1px solid var(--border); border-radius: 6px;
+    color: var(--muted); cursor: pointer; padding: 5px 8px; font: inherit; line-height: 1;
+  }
+  .time-range .clr:hover { color: var(--bad); border-color: var(--bad); }
+
+  .cmp-table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  .cmp-table th {
+    background: var(--panel2); font-weight: 700; padding: 8px 12px;
+    text-align: center; border: 1px solid var(--border);
+    position: static; cursor: default; user-select: auto; white-space: normal;
+  }
+  .cmp-table td {
+    border: 1px solid var(--border); padding: 7px 10px;
+    text-align: center; vertical-align: top; white-space: normal;
+  }
+  .cmp-th-task { text-align: left !important; min-width: 160px; color: var(--muted); }
+  .cmp-td-task { text-align: left; background: var(--panel2); font-weight: 500; white-space: nowrap; }
+  .cmp-cell { min-width: 130px; }
+  .cmp-ok   { border-top: 2px solid var(--ok); }
+  .cmp-bad  { border-top: 2px solid var(--bad); }
+  .cmp-empty { color: var(--muted); }
+  .cmp-winner { background: rgba(63,185,108,.09); }
+  .badge { display: inline-block; border-radius: 3px; padding: 1px 5px; font-size: 11px; font-weight: 700; margin-right: 2px; }
+  .badge-ok  { background: rgba(63,185,108,.18); color: var(--ok); }
+  .badge-bad { background: rgba(224,95,95,.18);  color: var(--bad); }
+  .badge-na  { background: var(--panel2); color: var(--muted); }
+  .cell-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+  /* ── Task cost / artifact tables ─────────────── */
+  .tc-task  { text-align: left; background: var(--panel2); font-weight: 500; white-space: nowrap; }
+  .tc-cell  { text-align: center; vertical-align: top; white-space: normal; min-width: 120px; }
+  .tc-empty { text-align: center; color: var(--muted); }
+  /* ── Collapsible artifact section ───────────────── */
+  .art-summary {
+    cursor: pointer; list-style: none;
+    display: flex; align-items: center; gap: 8px; margin: 0;
+  }
+  .art-summary::-webkit-details-marker, .art-summary::marker { display: none; }
+  .art-summary .art-chevron { color: var(--muted); font-size: 10px; transition: transform .15s; display: inline-block; }
+  details.art-details[open] .art-chevron { transform: rotate(90deg); }
+  details.art-details[open] > summary { margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div id="header-row">
+  <h1>Factory eval results viewer</h1>
+  <div id="load-area">
+    <div id="loadedFiles"></div>
+    <button id="addBtn" title="Drop CSV files anywhere or click to browse (evals/results/*.csv)">+</button>
+    <input type="file" id="fileInput" accept=".csv" multiple style="display:none">
+  </div>
+</div>
+
+<div id="filters" class="hidden">
+  <div class="filter"><label>Batch</label><select id="batchSel"></select></div>
+  <div class="filter"><label>Track</label><select id="trackSel"></select></div>
+  <div class="filter"><label>Task</label><select id="taskSel"></select></div>
+  <div class="filter"><label>Models</label><div id="modelChecks"></div></div>
+  <div class="filter">
+    <label>Time range (created_at)</label>
+    <div class="time-range">
+      <input type="datetime-local" id="timeFrom" title="Start">
+      <span class="sep">to</span>
+      <input type="datetime-local" id="timeTo" title="End">
+      <button class="clr" id="timeClear" title="Clear time filter">×</button>
+    </div>
+  </div>
+</div>
+
+<div id="notice">No data loaded. Drop one or more result CSVs above.</div>
+
+<div id="comparison" class="hidden"></div>
+<div id="cards"></div>
+<div id="charts"></div>
+<div id="artifactsWrap" class="hidden"></div>
+<div id="tableWrap" class="hidden">
+  <h2>Runs</h2>
+  <table>
+    <thead><tr id="theadRow"></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+'use strict';
+const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
+const dbg = (...a) => { if (DEBUG) console.log('[viewer]', ...a); };
+
+// ---------- CSV parsing ----------
+function parseCSV(text) {
+  const rows = []; let row = [], field = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQ = false; }
+      else field += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.length > 1 || row[0] !== '') rows.push(row);
+      row = [];
+    } else field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.length > 1 || row[0] !== '') rows.push(row); }
+  return rows;
+}
+
+const NUM_FIELDS = ['run_time_seconds', 'wall_time_seconds', 'inference_cost_usd',
+  'compute_cost_usd', 'platform_credits', 'total_cost_usd', 'num_artifacts'];
+
+function normalizeRows(fileName, text) {
+  const raw = parseCSV(text);
+  if (!raw.length) return [];
+  const header = raw[0].map(h => h.trim());
+  // Unify batch column: eval_tag / batch_timestamp → 'batch'.
+  const hasBatchCol = header.some(h => h === 'eval_tag' || h === 'batch_timestamp');
+  const hasSuccessCol = header.includes('success');
+  const batchStem = fileName.replace(/\.[^.]+$/, ''); // filename without extension
+  const keys = header.map(h => (h === 'eval_tag' || h === 'batch_timestamp') ? 'batch' : h);
+  const out = [];
+  for (let r = 1; r < raw.length; r++) {
+    const rec = { source_file: fileName };
+    keys.forEach((k, i) => rec[k] = raw[r][i] !== undefined ? raw[r][i].trim() : '');
+    // Batch: use file stem when no explicit batch column present.
+    if (!hasBatchCol) rec.batch = batchStem;
+    // Success: derive from 'state' when no explicit boolean success column.
+    if (hasSuccessCol) {
+      rec.success = String(rec.success).toLowerCase() === 'true';
+    } else {
+      const st = (rec.state || '').toLowerCase();
+      rec.success = st === 'success' || st === 'succeeded';
+    }
+    // Compat: map old field names → names the rest of the viewer uses.
+    if (!rec.created_at  && rec.start_timestamp)   rec.created_at       = rec.start_timestamp;
+    if (!rec.tracker_issue_ids && rec.linear_issue_ids) rec.tracker_issue_ids = rec.linear_issue_ids;
+    if (!rec.tracker_issue_ids && rec.linear_issue_key) rec.tracker_issue_ids = rec.linear_issue_key;
+    if (!rec.tracker_urls && rec.linear_urls)      rec.tracker_urls     = rec.linear_urls;
+    if (!rec.tracker_urls && rec.linear_issue_url) rec.tracker_urls     = rec.linear_issue_url;
+    for (const f of NUM_FIELDS) {
+      const v = rec[f];
+      rec[f] = (v === '' || v === undefined || isNaN(Number(v))) ? null : Number(v);
+    }
+    out.push(rec);
+  }
+  dbg(`parsed ${fileName}: ${out.length} rows`);
+  return out;
+}
+
+// ---------- State ----------
+const files = new Map(); // fileName -> rows (reload replaces)
+const state = { batch: '', track: '', task: '', timeFrom: '', timeTo: '', models: new Set() };
+let sortKey = null, sortAsc = true;
+
+const allRows = () => [...files.values()].flat();
+
+// ---------- File loading ----------
+const fileInput = document.getElementById('fileInput');
+const addBtn    = document.getElementById('addBtn');
+addBtn.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { loadFiles(fileInput.files); fileInput.value = ''; });
+// Drag anywhere on the page; counter handles nested-element dragleave noise.
+let _dragCnt = 0;
+document.addEventListener('dragenter', () => { _dragCnt++; addBtn.classList.add('drag'); });
+document.addEventListener('dragleave', () => { if (--_dragCnt <= 0) { _dragCnt = 0; addBtn.classList.remove('drag'); } });
+document.addEventListener('dragover',  e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault(); _dragCnt = 0; addBtn.classList.remove('drag');
+  loadFiles(e.dataTransfer.files);
+});
+
+function loadFiles(fileList) {
+  const jobs = [...fileList].map(f => f.text().then(t => files.set(f.name, normalizeRows(f.name, t))));
+  Promise.all(jobs).then(() => { resetFilters(); render(); });
+}
+
+function removeFile(name) { files.delete(name); resetFilters(); render(); }
+
+function resetFilters() {
+  state.batch = ''; state.track = ''; state.task = '';
+  state.timeFrom = ''; state.timeTo = '';
+  const fi = document.getElementById('timeFrom');
+  const ti = document.getElementById('timeTo');
+  if (fi) fi.value = ''; if (ti) ti.value = '';
+  state.models = new Set(allRows().map(r => r.model).filter(Boolean));
+  sortKey = null;
+}
+
+// ---------- Filtering / aggregation ----------
+function uniq(arr) { return [...new Set(arr)].filter(v => v !== '' && v !== undefined).sort(); }
+
+// Primary timestamp for a row: created_at / start_timestamp preferred.
+function rowPrimaryTime(r) {
+  for (const f of ['created_at', 'start_timestamp', 'started_at', 'updated_at']) {
+    const t = Date.parse(r[f]);
+    if (!isNaN(t)) return t;
+  }
+  return null;
+}
+
+// Convert a Date to the YYYY-MM-DDTHH:MM string datetime-local inputs expect.
+function toDatetimeLocal(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function filteredRows() {
+  const from = state.timeFrom ? new Date(state.timeFrom).getTime() : null;
+  const to   = state.timeTo   ? new Date(state.timeTo).getTime()   : null;
+  return allRows().filter(r => {
+    if (state.batch && r.batch    !== state.batch)  return false;
+    if (state.track && r.track    !== state.track)  return false;
+    if (state.task  && r.task_id  !== state.task)   return false;
+    if (!state.models.has(r.model))                 return false;
+    if (from !== null || to !== null) {
+      const t = rowPrimaryTime(r);
+      if (t !== null) {
+        if (from !== null && t < from) return false;
+        if (to   !== null && t > to)   return false;
+      }
+    }
+    return true;
+  });
+}
+
+function avg(rows, field) {
+  const vals = rows.map(r => r[field]).filter(v => v !== null);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+
+function aggregateByModel(rows) {
+  const byModel = new Map();
+  for (const r of rows) {
+    if (!byModel.has(r.model)) byModel.set(r.model, []);
+    byModel.get(r.model).push(r);
+  }
+  const aggs = [];
+  for (const [model, rs] of byModel) {
+    aggs.push({
+      model, n: rs.length,
+      successRate: rs.filter(r => r.success).length / rs.length,
+      runTime: avg(rs, 'run_time_seconds'),
+      inferenceCost: avg(rs, 'inference_cost_usd'),
+      computeCost: avg(rs, 'compute_cost_usd'),
+      platformCost: avg(rs, 'platform_credits'),
+      totalCost: avg(rs, 'total_cost_usd'),
+      artifacts: avg(rs, 'num_artifacts'),
+    });
+  }
+  aggs.sort((a, b) => a.model.localeCompare(b.model));
+  dbg('aggregates', aggs);
+  return aggs;
+}
+
+// ---------- Colors ----------
+const PALETTE = ['#4fa3ff', '#f2a13c', '#3fb96c', '#d666d6', '#e05f5f',
+  '#3ecfcf', '#b8b83c', '#8a7ff0', '#f078a0', '#7fbf5a'];
+function modelColor(model) {
+  const models = uniq(allRows().map(r => r.model));
+  return PALETTE[models.indexOf(model) % PALETTE.length];
+}
+
+// ---------- Rendering ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = (v, dp = 2) => v === null || v === undefined ? '–' : Number(v).toFixed(dp);
+
+function render() {
+  renderFileChips();
+  const rows = allRows();
+  const hasData = rows.length > 0;
+  $('filters').classList.toggle('hidden', !hasData);
+  $('notice').classList.toggle('hidden', hasData);
+  if (!hasData) {
+    $('notice').textContent = files.size
+      ? 'Loaded file(s) contain a header but no data rows.'
+      : 'No data loaded. Drop one or more result CSVs above.';
+    $('cards').innerHTML = ''; $('charts').innerHTML = '';
+    $('tableWrap').classList.add('hidden');
+    $('comparison').classList.add('hidden'); $('comparison').innerHTML = '';
+    $('artifactsWrap').classList.add('hidden'); $('artifactsWrap').innerHTML = '';
+    return;
+  }
+  renderFilters(rows);
+  const rs = filteredRows();
+  const aggs = aggregateByModel(rs);
+  renderCards(aggs);
+  renderCharts(aggs);
+  renderArtifacts(rs);
+  renderTable(rs);
+}
+
+function renderFileChips() {
+  $('loadedFiles').innerHTML = [...files.entries()].map(([name, rows]) =>
+    `<span class="chip"><b>${esc(name)}</b> (${rows.length} rows)` +
+    `<span class="x" data-file="${esc(name)}" title="Remove">✕</span></span>`).join('');
+  $('loadedFiles').querySelectorAll('.x').forEach(el =>
+    el.addEventListener('click', e => { e.stopPropagation(); removeFile(el.dataset.file); }));
+}
+
+function fillSelect(sel, values, current, allLabel) {
+  sel.innerHTML = `<option value="">${allLabel}</option>` +
+    values.map(v => `<option value="${esc(v)}"${v === current ? ' selected' : ''}>${esc(v)}</option>`).join('');
+}
+
+function renderFilters(rows) {
+  // Batch — newest first (tags are timestamped so reverse-alpha ≈ newest first)
+  fillSelect($('batchSel'), uniq(rows.map(r => r.batch)).slice().reverse(), state.batch, 'All batches');
+  fillSelect($('trackSel'), uniq(rows.map(r => r.track)), state.track, 'All tracks');
+  // Task options respect both batch and track
+  const taskPool = rows.filter(r =>
+    (!state.batch || r.batch === state.batch) &&
+    (!state.track || r.track === state.track));
+  fillSelect($('taskSel'), uniq(taskPool.map(r => r.task_id)), state.task, 'All tasks');
+  $('modelChecks').innerHTML = uniq(rows.map(r => r.model)).map(m =>
+    `<label><input type="checkbox" value="${esc(m)}"${state.models.has(m) ? ' checked' : ''}>` +
+    `<span class="swatch" style="background:${modelColor(m)}"></span>${esc(m)}</label>`).join('');
+  $('modelChecks').querySelectorAll('input').forEach(cb =>
+    cb.addEventListener('change', () => {
+      cb.checked ? state.models.add(cb.value) : state.models.delete(cb.value);
+      render();
+    }));
+  // Set min/max hints on time inputs from data range
+  const times = rows.map(rowPrimaryTime).filter(t => t !== null);
+  if (times.length) {
+    const lo = toDatetimeLocal(new Date(Math.min(...times)));
+    const hi = toDatetimeLocal(new Date(Math.max(...times)));
+    const fi = $('timeFrom'), ti = $('timeTo');
+    fi.min = lo; fi.max = hi;
+    ti.min = lo; ti.max = hi;
+  }
+}
+
+$('batchSel').addEventListener('change', e => { state.batch = e.target.value; state.task = ''; render(); });
+$('trackSel').addEventListener('change', e => { state.track = e.target.value; state.task = ''; render(); });
+$('taskSel').addEventListener('change', e => { state.task = e.target.value; render(); });
+$('timeFrom').addEventListener('change', e => { state.timeFrom = e.target.value; render(); });
+$('timeTo').addEventListener('change', e => { state.timeTo = e.target.value; render(); });
+$('timeClear').addEventListener('click', () => {
+  state.timeFrom = ''; state.timeTo = '';
+  $('timeFrom').value = ''; $('timeTo').value = '';
+  render();
+});
+
+function renderCards(aggs) {
+  $('cards').innerHTML = aggs.map(a => `
+    <div class="card" style="border-top-color:${modelColor(a.model)}">
+      <div class="model">${esc(a.model)}</div>
+      <div class="kv"><span>runs</span><span>${a.n}</span></div>
+      <div class="kv"><span>success</span><span>${(a.successRate * 100).toFixed(0)}%</span></div>
+      <div class="kv"><span>avg cost</span><span>$${fmt(a.totalCost, 4)}</span></div>
+      <div class="kv"><span>avg time</span><span>${fmt(a.runTime, 1)}s</span></div>
+    </div>`).join('');
+}
+
+// Horizontal SVG bar chart. items: [{label, value, color, segments?:[{value,color}]}]
+function barChartSVG(title, items, fmtVal, legend) {
+  const rowH = 26, labelW = 190, valueW = 80, w = 640, padT = 4;
+  const h = items.length * rowH + padT * 2;
+  const maxV = Math.max(...items.map(i => i.value ?? 0), 1e-9);
+  const barMax = w - labelW - valueW;
+  let bars = '';
+  items.forEach((it, idx) => {
+    const y = padT + idx * rowH;
+    const v = it.value ?? 0;
+    const bw = Math.max((v / maxV) * barMax, v > 0 ? 2 : 0);
+    let rects = '';
+    if (it.segments) {
+      let x = labelW;
+      for (const s of it.segments) {
+        const sw = v > 0 ? (s.value / v) * bw : 0;
+        rects += `<rect x="${x}" y="${y + 4}" width="${sw}" height="${rowH - 10}" fill="${s.color}" rx="2"/>`;
+        x += sw;
+      }
+    } else {
+      rects = `<rect x="${labelW}" y="${y + 4}" width="${bw}" height="${rowH - 10}" fill="${it.color}" rx="2"/>`;
+    }
+    bars += `
+      <text class="bar-label" x="${labelW - 8}" y="${y + rowH / 2 + 3}" text-anchor="end">${esc(it.label)}</text>
+      ${rects}
+      <text class="bar-value" x="${labelW + bw + 6}" y="${y + rowH / 2 + 3}">${it.value === null ? '–' : fmtVal(it.value)}</text>`;
+  });
+  return `<div class="chart"><h2>${esc(title)}</h2>
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMinYMin meet">${bars}</svg>
+    ${legend || ''}</div>`;
+}
+
+const COST_COLORS = { inference: '#4fa3ff', compute: '#f2a13c', platform: '#9aa0a8' };
+
+function renderCharts(aggs) {
+  if (!aggs.length) { $('charts').innerHTML = ''; return; }
+  const mc = a => modelColor(a.model);
+  const charts = [
+    barChartSVG('Success rate',
+      aggs.map(a => ({ label: a.model, value: a.successRate, color: mc(a) })),
+      v => (v * 100).toFixed(0) + '%'),
+    barChartSVG('Avg run time (s)',
+      aggs.map(a => ({ label: a.model, value: a.runTime, color: mc(a) })),
+      v => v.toFixed(1) + 's'),
+    barChartSVG('Avg total cost ($, stacked)',
+      aggs.map(a => ({
+        label: a.model, value: a.totalCost, color: mc(a),
+        segments: [
+          { value: a.inferenceCost ?? 0, color: COST_COLORS.inference },
+          { value: a.computeCost ?? 0, color: COST_COLORS.compute },
+          { value: a.platformCost ?? 0, color: COST_COLORS.platform },
+        ],
+      })),
+      v => '$' + v.toFixed(4),
+      `<div class="legend">${Object.entries(COST_COLORS).map(([k, c]) =>
+        `<span><span class="swatch" style="background:${c}"></span>${k}</span>`).join('')}</div>`),
+  ];
+  $('charts').innerHTML = charts.join('');
+}
+
+// ---------- Artifact success ----------
+// Returns true when a list-column string (semicolon-delimited) has at least one entry.
+const hasEntries = s => Boolean(s && s.trim());
+
+// Track-specific success definitions (supports both old and new track names).
+// New format: implement / review   Old format: implementation / code-review
+const TRACK_SUCCESS_DEF = {
+  triage:         r => hasEntries(r.tracker_issue_ids),
+  spec:           r => r.spec_approved === 'yes' || (r.success && hasEntries(r.pr_urls)),
+  implement:      r => r.pr_state === 'MERGED',
+  implementation: r => r.pr_state === 'MERGED',
+  review:         r => r.pr_review_decision === 'APPROVED' || r.success,
+  'code-review':  r => r.pr_review_decision === 'APPROVED' || r.success,
+};
+const TRACK_SUCCESS_LABEL = {
+  triage:         'issue filed',
+  spec:           'spec approved',
+  implement:      'PR merged',
+  implementation: 'PR merged',
+  review:         'review approved',
+  'code-review':  'review approved',
+};
+
+function trackSuccess(r) {
+  const fn = TRACK_SUCCESS_DEF[r.track];
+  return fn ? fn(r) : r.success;
+}
+
+// Donut pie chart. slices: [{label, value, color}], optional footer HTML.
+// First slice is the "success" slice; its % is shown in the center.
+function pieChartSVG(title, slices, footer = '') {
+  const cx = 38, cy = 35, R = 28, ri = 18;
+  const total = slices.reduce((s, sl) => s + sl.value, 0);
+  const w = 76, h = 70;
+  let inner = '';
+  if (!total) {
+    inner = `<circle cx="${cx}" cy="${cy}" r="${R}" fill="var(--border)"/>
+      <circle cx="${cx}" cy="${cy}" r="${ri}" fill="var(--panel)"/>
+      <text x="${cx}" y="${cy + 5}" text-anchor="middle" font-size="12" fill="var(--muted)">no data</text>`;
+  } else {
+    const active = slices.filter(s => s.value > 0);
+    if (active.length === 1) {
+      inner = `<circle cx="${cx}" cy="${cy}" r="${R}" fill="${active[0].color}" opacity=".9"/>`;
+    } else {
+      let a = -Math.PI / 2;
+      for (const sl of slices) {
+        if (!sl.value) continue;
+        const b = a + (sl.value / total) * 2 * Math.PI;
+        const lg = (b - a) > Math.PI ? 1 : 0;
+        const [x0,y0] = [cx + R*Math.cos(a), cy + R*Math.sin(a)];
+        const [x1,y1] = [cx + R*Math.cos(b), cy + R*Math.sin(b)];
+        const [i0,j0] = [cx + ri*Math.cos(a), cy + ri*Math.sin(a)];
+        const [i1,j1] = [cx + ri*Math.cos(b), cy + ri*Math.sin(b)];
+        inner += `<path d="M${x0.toFixed(1)},${y0.toFixed(1)} A${R},${R} 0 ${lg},1 ${x1.toFixed(1)},${y1.toFixed(1)} L${i1.toFixed(1)},${j1.toFixed(1)} A${ri},${ri} 0 ${lg},0 ${i0.toFixed(1)},${j0.toFixed(1)} Z" fill="${sl.color}" opacity=".9"/>`;
+        a = b;
+      }
+    }
+    inner += `<circle cx="${cx}" cy="${cy}" r="${ri}" fill="var(--panel)"/>`;
+    const pct = slices[0] ? (slices[0].value / total * 100).toFixed(0) : '0';
+    const lbl = slices[0] ? esc(slices[0].label) : '';
+    inner += `<text x="${cx}" y="${cy - 3}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--text)">${pct}%</text>`;
+    inner += `<text x="${cx}" y="${cy + 8}" text-anchor="middle" font-size="7" fill="var(--muted)">${lbl}</text>`;
+  }
+  const legend = slices.map(sl =>
+    `<span><span class="swatch" style="background:${sl.color};opacity:.9"></span><span style="color:var(--muted)">${esc(sl.label)} (${sl.value})</span></span>`
+  ).join('');
+  return `<div class="chart"><h2>${esc(title)}</h2>
+    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">${inner}</svg>
+    <div class="legend">${legend}</div>
+    ${footer}</div>`;
+}
+
+function renderArtifacts(rows) {
+  const el = $('artifactsWrap');
+  const models = uniq(rows.map(r => r.model));
+  if (!models.length || !rows.length) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+
+  // Determine tracks present to show relevant success definitions
+  const tracks = uniq(rows.map(r => r.track));
+  const defLines = tracks.map(t =>
+    `${esc(t)} → ${esc(TRACK_SUCCESS_LABEL[t] || 'run succeeded')}`
+  ).join(' &nbsp;·&nbsp; ');
+
+  // Total success across all rows
+  const totalOk   = rows.filter(trackSuccess).length;
+  const totalPct  = rows.length ? Math.round(totalOk / rows.length * 100) : 0;
+  const totalColor = totalPct >= 70 ? 'var(--ok)' : totalPct >= 40 ? '#f2a13c' : 'var(--bad)';
+
+  // One donut per model: track-specific success vs not
+  const pies = models.map(m => {
+    const rs = rows.filter(r => r.model === m);
+    const ok   = rs.filter(trackSuccess).length;
+    const fail = rs.length - ok;
+    // Choose success label: single track => specific label, mixed => 'succeeded'
+    const successLabel = tracks.length === 1
+      ? (TRACK_SUCCESS_LABEL[tracks[0]] || 'succeeded') : 'succeeded';
+    const cost = avg(rs, 'total_cost_usd');
+    const costStr = cost !== null ? '$' + cost.toFixed(4) : '–';
+    return pieChartSVG(m, [
+      { label: successLabel,       value: ok,   color: 'var(--ok)' },
+      { label: 'not ' + successLabel, value: fail, color: '#2a2d34' },
+    ], `<div style="font-size:11px;color:var(--muted);margin-top:4px;text-align:center">avg cost ${costStr}</div>`);
+  });
+
+  el.innerHTML = `<div class="cmp-wrap">
+    <details class="art-details" open>
+      <summary class="art-summary">
+        <span style="font-size:14px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)">Success rate</span>
+        <span class="art-chevron">▶</span>
+      </summary>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px">${defLines || 'run succeeded'}</p>
+      <div style="font-size:13px;margin-bottom:14px">
+        Total: <strong style="color:var(--text)">${totalOk} / ${rows.length}</strong>
+        <span style="color:${totalColor};font-weight:700"> ${totalPct}%</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,190px);gap:8px">${pies.join('')}</div>
+    </details>
+  </div>`;
+  el.classList.remove('hidden');
+}
+
+// ---------- Table ----------
+const TABLE_COLS = [
+  ['batch', 'batch'], ['track', 'track'], ['model', 'model'], ['task_id', 'task'],
+  ['state', 'state'], ['success', 'ok'], ['run_time_seconds', 'time (s)'],
+  ['total_cost_usd', 'cost ($)'],
+  ['tracker_issue_ids', 'issue'],
+  ['spec_approved', 'spec'], ['pr_state', 'PR state'], ['pr_review_decision', 'review decision'],
+  ['pr_urls', 'PRs'],
+  ['error_code', 'error'], ['status_message', 'message'], ['run_link', 'run'],
+];
+
+function linkCell(urls, textPrefix) {
+  if (!urls) return '';
+  return String(urls).split(/[\s;,]+/).filter(Boolean).map((u, i) =>
+    `<a href="${esc(u)}" target="_blank" rel="noopener">${textPrefix}${i + 1}</a>`).join(' ');
+}
+
+function cellValue(r, key) {
+  const v = r[key];
+  if (key === 'success')           return `<td class="${v ? 'ok' : 'bad'}">${v ? '✓' : '✗'}</td>`;
+  if (key === 'run_time_seconds')  return `<td>${fmt(v, 1)}</td>`;
+  if (key === 'total_cost_usd')    return `<td>${fmt(v, 4)}</td>`;
+  if (key === 'run_link')          return `<td>${linkCell(v, 'run')}</td>`;
+  if (key === 'pr_urls')           return `<td>${linkCell(v, 'PR')}</td>`;
+  if (key === 'status_message')    return `<td class="msg" title="${esc(v ?? '')}">${esc(v ?? '')}</td>`;
+  return `<td>${esc(v ?? '')}</td>`;
+}
+
+function renderTable(rows) {
+  $('tableWrap').classList.remove('hidden');
+  if (sortKey) {
+    rows = [...rows].sort((a, b) => {
+      let av = a[sortKey], bv = b[sortKey];
+      if (av === null) av = -Infinity; if (bv === null) bv = -Infinity;
+      const cmp = (typeof av === 'number' && typeof bv === 'number')
+        ? av - bv : String(av).localeCompare(String(bv));
+      return sortAsc ? cmp : -cmp;
+    });
+  }
+  $('theadRow').innerHTML = TABLE_COLS.map(([k, label]) =>
+    `<th data-key="${k}">${esc(label)}${sortKey === k ? ` <span class="arrow">${sortAsc ? '▲' : '▼'}</span>` : ''}</th>`).join('');
+  $('theadRow').querySelectorAll('th').forEach(th =>
+    th.addEventListener('click', () => {
+      const k = th.dataset.key;
+      if (sortKey === k) sortAsc = !sortAsc; else { sortKey = k; sortAsc = true; }
+      render();
+    }));
+  $('tbody').innerHTML = rows.map(r =>
+    `<tr>${TABLE_COLS.map(([k]) => cellValue(r, k)).join('')}</tr>`
+  ).join('');
+}
+
+render();
+</script>
+</body>
+</html>

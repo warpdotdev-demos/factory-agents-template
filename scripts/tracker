@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""tracker -- provider-agnostic issue-tracking CLI for the factory loop.
+
+This is the tracker abstraction seam. It resolves the provider to use, then
+delegates all subcommands to that provider's script. Provider resolution order:
+
+  1. the `--provider` flag;
+  2. the `FACTORY_TRACKER_PROVIDER` environment variable;
+  3. `tracker.provider` in the foreman config (foreman/config.json);
+  4. the built-in default, `jira`.
+
+Currently supported providers:
+  jira               -> scripts/jira               (default; Jira Cloud REST backend)
+  mock-issue-tracker -> scripts/mock-issue-tracker (in-memory mock backend, evals only)
+
+Subcommands are passed through unchanged to the provider script, so each
+provider's commands, flags, output shapes, and behavior are exactly its own.
+The `mock-issue-tracker` provider mirrors the same command surface but keeps
+data in a local store and always succeeds; it is intended for the eval harness
+(`scripts/factory-eval`), not for real work.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+DEFAULT_PROVIDER = "jira"
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_FOREMAN_CONFIG = os.path.join(_REPO_ROOT, "foreman", "config.json")
+_PROVIDER_SCRIPTS = {
+    "jira": os.path.join(_REPO_ROOT, "scripts", "jira"),
+    "mock-issue-tracker": os.path.join(_REPO_ROOT, "scripts", "mock-issue-tracker"),
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def _config_provider():
+    """`tracker.provider` from the foreman config; None if absent/unreadable."""
+    try:
+        with open(_FOREMAN_CONFIG, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    tracker = data.get("tracker")
+    if not isinstance(tracker, dict):
+        return None
+    provider = tracker.get("provider")
+    return provider if isinstance(provider, str) and provider else None
+
+
+def resolve_provider(flag_value=None, env_value=None, config_value=None):
+    """First non-empty of: --provider flag, env var, config value; else default."""
+    for candidate in (flag_value, env_value, config_value):
+        if candidate:
+            return candidate
+    return DEFAULT_PROVIDER
+
+
+def provider_script(provider):
+    script = _PROVIDER_SCRIPTS.get(provider)
+    if script is None:
+        die(f"unknown tracker provider: {provider!r}")
+    if not os.path.isfile(script) or not os.access(script, os.X_OK):
+        die(f"provider script not found or not executable: {script}")
+    return script
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="tracker",
+        description=(
+            "Provider-agnostic issue-tracking CLI for the factory loop. "
+            "Delegates subcommands to the configured provider script."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "Tracker provider to use. Defaults to the FACTORY_TRACKER_PROVIDER "
+            "environment variable, then tracker.provider in foreman/config.json, "
+            "then 'jira'."
+        ),
+    )
+    parser.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help="Subcommand and arguments to pass through to the provider script.",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not args.remainder:
+        die("tracker: no subcommand given")
+
+    provider = resolve_provider(
+        args.provider,
+        os.environ.get("FACTORY_TRACKER_PROVIDER"),
+        _config_provider(),
+    )
+    script = provider_script(provider)
+    try:
+        result = subprocess.run([script, *args.remainder])
+    except OSError as e:
+        die(f"failed to run provider {provider!r}: {e}")
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""factory-dispatch — resolve the run_agents parameters for one factory child step.
+
+This is the deterministic MECHANICS half of the foreman's job: given a chosen
+track (triage / spec / implementation / code-review) and a prompt brief, it
+resolves the target subagent's CONFIG (base skill + model) + the shared
+environment and emits a ready-to-use `run_agents` tool-call payload as JSON. The
+foreman then dispatches the child by CALLING the `run_agents` tool with that
+payload — the actual child run is launched by the platform's orchestration tool,
+not by this script. This script performs NO network I/O and hits NO API.
+
+It contains NO routing JUDGMENT — deciding *which* track a request belongs to
+is the foreman's job (the factory-foreman skill). This script only resolves a
+track to its config and composes the `run_agents` arguments, mirroring the thin,
+deterministic style of factory-state (resolve config, compose JSON, fail loud).
+
+Dispatch is BY CONFIG, not by identity: each subagent's skill/model is applied
+inline in the `run_agents` payload and the child executes as the foreman itself
+(the `run_agents` tool links the child to the calling foreman run automatically).
+There is no `agent_identity_uid` to set: the foreman runs as a service account,
+and the server forbids a service-account caller from setting a different
+execution principal ("agents cannot specify a different execution principal").
+Reconstructing the config inline keeps execution principal = foreman while still
+giving the child the right skills/model.
+
+skill + model are per-track (from <track>/config.json);
+environment_id is shared and comes from the agent's environment
+(FACTORY_FOREMAN_ENV), like the Jira API token comes from $JIRA_API_TOKEN.
+
+Resolution order for skill (per track), first wins:
+  1. explicit flag (--skill)
+  2. env var override (FACTORY_FOREMAN_<TRACK>_SKILL; TRACK upper,
+     hyphens -> underscores, e.g. code-review -> CODE_REVIEW)
+  3. derived from <track>/config.json:
+     <repos.self>:<track>/.agents/skills/<agent.entrypoint_skill>/SKILL.md
+The resolved skill is emitted as a `run_agents` skills[] entry (a
+repository-qualified `org/repo:path/to/SKILL.md` spec) so the tool attaches it
+to the child; the child brief also names it as the entry point to read first.
+
+Resolution order for model (per track, optional), first wins:
+  1. explicit flag (--model)
+  2. env var override (FACTORY_FOREMAN_<TRACK>_MODEL)
+  3. model in <track>/config.json (a plain model-id string, e.g. "auto").
+The resolved model is emitted as `run_agents` `model_id`.
+
+Every dispatched child run is NAMED deterministically as
+FA_<track>_<current UTC timestamp> (e.g. FA_triage_2024-04-15T14:30 — the track
+is a single token with no spaces and the timestamp is the current UTC time to
+the minute) unless an explicit --name is passed, which wins (see
+_build_run_name). The name is emitted as the child's `run_agents`
+agent_run_configs[].name.
+
+Resolution order for environment_id (shared), first wins:
+  1. explicit flag (--environment)
+  2. agent environment variable (FACTORY_FOREMAN_ENV)
+If unresolved, the `run_agents` tool's own default environment applies (the child
+inherits the foreman's environment); it is never hardcoded in config. When
+resolved, it is emitted as `run_agents` remote.environment_id.
+
+Resolution order for parent run id (names the foreman run the child reports step
+  completion to; embedded in the coordination footer of the child brief), first
+  wins:
+  1. explicit flag (--parent-run-id) — PREFERRED; pass the foreman's current
+     run id explicitly so the child always reports to the live foreman.
+  2. CURRENT_RUN_ID env var (the runtime-provided / current foreman run id)
+  3. OZ_RUN_ID env var (the dispatching foreman's run id, injected by the
+     worker at launch). This is only set at launch, so it can be STALE after a
+     resume / follow-up and name an older foreman run. To avoid the child
+     reporting completion to the wrong (stale) foreman, prefer 1 or 2 over it,
+     and a divergence between these signals is warned about loudly on stderr.
+Note the `run_agents` tool also links the child to the calling foreman run
+automatically; the footer's embedded id is what the child messages on step
+completion, and downstream skills read it as `parent_run_id`.
+
+Resolution order for the Oz web origin (used only to build the child's run link
+after the tool returns its run id), first wins:
+  1. explicit flag (--api-url) host, mapped to its Oz web host
+  2. FACTORY_FOREMAN_API_URL env var host, mapped to its Oz web host
+  3. https://oz.warp.dev (mapped from the production default)
+The child run link is <oz-web-origin>/runs/<run_id>, the same "View run in Oz"
+page the Slack / Jira integrations link to. This script does not know the run
+id (the `run_agents` tool returns it as agent_id), so it emits `oz_web_origin`
+and `run_link_template` and the foreman substitutes the returned id. The runs
+API and the Oz web app are served from DIFFERENT hosts (e.g. API staging.warp.dev
+vs web oz.staging.warp.dev; API app.warp.dev vs web oz.warp.dev), so the web
+origin is mapped from the API host rather than reused verbatim — see
+_oz_web_origin.
+
+A still-unresolved (or placeholder REPLACE_ME) skill or parent run id fails
+loudly with the flag/env-var to set. model and environment_id are optional; if
+unresolved, the tool's own defaults apply.
+
+The child brief is PREPENDED with the track's standing playbook
+(<track>/AGENTS.md) so the child receives its full track role/playbook in
+addition to the foreman's brief handoff description. A missing or empty AGENTS.md
+is a non-fatal warning; the brief alone still dispatches. The playbook is emitted
+as the shared `run_agents` base_prompt (prepended to every child prompt); the
+task brief + coordination footer are emitted as the per-child prompt.
+
+The child brief is suffixed with a deterministic COORDINATION FOOTER (built
+from the resolved parent run id) so the foreman's step-gated state machine works
+without each subagent skill hardcoding the foreman's id: it tells the child to
+message the foreman on STEP COMPLETION (after it applies the next gate label),
+to route any Slack-door gating ask through the foreman as a `RELAY:` message
+(children cannot post to the chat platform - only the foreman can speak in the
+originating chat thread), to post Jira-door asks itself via scripts/tracker,
+and to simply end if agent-to-agent messaging is unavailable (the foreman then
+advances off the ticket's gate label).
+
+Computer use is ENABLED by default on every dispatched child
+(remote.computer_use_enabled=true in the emitted payload). The `run_agents` tool
+otherwise defaults it to false, which would leave children without the
+computer_use tool and unable to satisfy the factory-verification mandate (triage
+reproducing UI defects, implementation / review capturing and checking
+screenshot proof for user-facing changes). Pass --no-computer-use to opt a
+specific run out.
+
+Python 3 stdlib only.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+AGENTS_DIR = REPO_ROOT
+
+TRACKS = ("triage", "spec", "implementation", "code-review")
+PLACEHOLDER = "REPLACE_ME"
+
+# The per-track standing playbook lives next to the track's config.json.
+AGENTS_MD_FILENAME = "AGENTS.md"
+
+# Prepended (with the track's AGENTS.md text) to the child brief so the child
+# reads its standing track playbook before the foreman's specific task brief.
+# Emitted as the shared run_agents base_prompt.
+TRACK_AGENTS_MD_HEADER = (
+    "# Track playbook - {track}/AGENTS.md\n"
+    "This is the standing playbook for your track. Read it first, then act on "
+    "the task brief that follows.\n\n"
+)
+# Fallback base_prompt when the track has no AGENTS.md playbook: still point the
+# child at its attached entry skill so dispatch works without a playbook.
+FALLBACK_BASE_PROMPT = (
+    "You are the factory {track} child step dispatched by the foreman. Read and "
+    "follow your attached entry skill, then act on the task brief that follows."
+)
+
+# Appended to every child brief (when a parent run id is resolved) so the
+# foreman can drive the step-gated loop. Keep this in sync with the foreman's
+# factory-foreman skill and the subagents' terminal-handoff steps.
+COORDINATION_FOOTER = (
+    "\n\n---\n"
+    "**Foreman coordination.** You are running as a child step of the factory "
+    "foreman (agent run id: {parent_run_id}). When your step is **complete** - "
+    "after you have applied the next pipeline gate label and posted your "
+    "artifacts to the ticket - send a brief completion message to the foreman "
+    "at that run id (via your agent-to-agent messaging tool) summarizing the "
+    "result, the artifacts you created (tracker issue / spec PR / PR / "
+    "review links + your Oz run link), and the gate label you applied, "
+    "then end your turn. If your step instead **pauses for required human "
+    "input** (a clarifying question, spec approval, or any other gating ask): "
+    "you CANNOT post to the chat platform yourself - only the foreman can "
+    "speak in the originating chat thread (e.g. the Slack thread), so never "
+    "attempt to post there or hunt for a way in. On a **Slack-door** task, "
+    "send the foreman a relay message instead (agent-to-agent, to the run id "
+    "above) with the subject prefixed `RELAY:` and a body containing the "
+    "exact, ready-to-post text of the ask (Slack mrkdwn, written for a "
+    "stranger); the foreman posts it to the thread verbatim and forwards the "
+    "human's reply back to you as a message that resumes you. On a "
+    "**Jira-door** task, post the ask yourself as a Jira comment via "
+    "`scripts/tracker`. Either way, record the durable content on the ticket "
+    "and end your turn. A `RELAY:` message is NOT a completion report - the "
+    "step is still incomplete and the foreman keeps waiting; send the "
+    "completion message only once the step actually completes. If "
+    "agent-to-agent messaging is unavailable, post the ask as a ticket "
+    "comment noting the conversation channel was unreachable, and end; on "
+    "completion just end after applying the label - the foreman advances off "
+    "the ticket's gate label."
+)
+
+# Only used to derive the Oz web origin for the child's run link (no API call is
+# ever made). Kept as an API-shaped URL so the same host->Oz-web-host mapping and
+# the FACTORY_FOREMAN_API_URL override that factory-eval uses keeps working.
+DEFAULT_API_URL = "https://app.warp.dev/api/v1/agent/runs"
+
+
+def _die(msg):
+    print(f"factory-dispatch: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _warn(msg):
+    """Emit a non-fatal warning to stderr (does not affect stdout JSON)."""
+    print(f"factory-dispatch: warning: {msg}", file=sys.stderr)
+
+
+def _env_key(track):
+    return track.upper().replace("-", "_")
+
+
+def _load_json(path, what):
+    """Read a JSON object from path, or None if absent. Fails loud on errors."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read {what} {path}: {e}")
+    if not isinstance(data, dict):
+        _die(f"{what} {path} must be a JSON object")
+    return data
+
+
+def _config_path(track):
+    return os.path.join(AGENTS_DIR, track, "config.json")
+
+
+def _load_config(track):
+    """Load a track's config.json, failing loud if it is missing."""
+    data = _load_json(_config_path(track), f"{track} config")
+    if data is None:
+        _die(f"no config for track {track!r}: expected {_config_path(track)}")
+    return data
+
+
+def _agents_md_path(track):
+    return os.path.join(AGENTS_DIR, track, AGENTS_MD_FILENAME)
+
+
+def _load_track_agents_md(track):
+    """Load the track's AGENTS.md playbook text, or None if absent/empty.
+
+    This is the standing per-track playbook that lives next to the track's
+    config.json (<track>/AGENTS.md). It is prepended to every child brief
+    so the child gets its full track role/playbook in addition to the foreman's
+    brief handoff. A missing/empty file is a non-fatal warning: the brief alone
+    still dispatches. A read error fails loud.
+    """
+    path = _agents_md_path(track)
+    if not os.path.isfile(path):
+        _warn(f"no AGENTS.md for track {track!r}: expected {path}")
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except OSError as e:
+        _die(f"could not read {track} AGENTS.md {path}: {e}")
+    if not text:
+        _warn(f"{track} AGENTS.md {path} is empty")
+        return None
+    return text
+
+
+def _build_base_prompt(track):
+    """Build the shared run_agents base_prompt from the track's AGENTS.md.
+
+    The base_prompt is prepended to every child prompt by the run_agents tool, so
+    it carries the standing track playbook. When no AGENTS.md is available, fall
+    back to a minimal lead-in that still points the child at its attached entry
+    skill so dispatch works without a playbook.
+    """
+    agents_md = _load_track_agents_md(track)
+    if not agents_md:
+        return FALLBACK_BASE_PROMPT.format(track=track)
+    return TRACK_AGENTS_MD_HEADER.format(track=track) + agents_md
+
+
+def _derive_skill(track, config):
+    """Derive the repo-qualified base SKILL.md spec for a track from its config.
+
+    <repos.self>:<track>/.agents/skills/<agent.entrypoint_skill>/SKILL.md.
+    Returns None if entrypoint_skill or repos.self is unset/placeholder.
+    """
+    agent = config.get("agent")
+    entry = agent.get("entrypoint_skill") if isinstance(agent, dict) else None
+    repos = config.get("repos")
+    repo = repos.get("self") if isinstance(repos, dict) else None
+    if not entry or entry == PLACEHOLDER:
+        return None
+    if not repo or repo == PLACEHOLDER:
+        return None
+    return f"{repo}:{track}/.agents/skills/{entry}/SKILL.md"
+
+
+def _resolve_skill(track, flag, config):
+    """Resolve the base skill via flag -> env var -> derived from config."""
+    if flag and flag != PLACEHOLDER:
+        return flag
+    env_val = os.environ.get(f"FACTORY_FOREMAN_{_env_key(track)}_SKILL")
+    if env_val and env_val != PLACEHOLDER:
+        return env_val
+    return _derive_skill(track, config)
+
+
+def _resolve_model(track, flag, config):
+    """Resolve the model via flag -> env var -> config (optional).
+
+    The config `model` must be a plain model-id string (e.g. "auto"). Returns
+    None when unresolved, in which case the run_agents tool's own default
+    applies.
+    """
+    if flag and flag != PLACEHOLDER:
+        return flag
+    env_val = os.environ.get(f"FACTORY_FOREMAN_{_env_key(track)}_MODEL")
+    if env_val and env_val != PLACEHOLDER:
+        return env_val
+    val = config.get("model")
+    if isinstance(val, dict):
+        _die(
+            f"model for track {track!r} must be a plain model-id string, "
+            f"not a JSON object"
+        )
+    if val and val != PLACEHOLDER:
+        return val
+    return None
+
+
+# Prefix for every auto-generated factory run name: FA_<track>_<timestamp>.
+RUN_NAME_PREFIX = "FA"
+
+
+def _build_run_name(explicit_name, track):
+    """Build the dispatched child run's name.
+
+    An explicit --name wins; otherwise the run is named deterministically as
+    FA_<track>_<current UTC timestamp> (e.g. FA_triage_2024-04-15T14:30). The
+    track is a single token with no spaces (triage / spec / implementation /
+    code-review) and the timestamp is the current UTC time to the minute
+    (%Y-%m-%dT%H:%M).
+    """
+    if explicit_name:
+        return explicit_name
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    return f"{RUN_NAME_PREFIX}_{track}_{timestamp}"
+
+
+def _resolve_environment(flag):
+    """Resolve the shared environment id (applies to every track).
+
+    Order: --environment flag -> FACTORY_FOREMAN_ENV (the agent environment
+    variable, like $JIRA_API_TOKEN). PLACEHOLDER is treated as unset; returns
+    None when unresolved, in which case the run_agents tool's default
+    environment applies (the child inherits the foreman's environment). The
+    environment id is never hardcoded in config.
+    """
+    if flag and flag != PLACEHOLDER:
+        return flag
+    env_val = os.environ.get("FACTORY_FOREMAN_ENV")
+    if env_val and env_val != PLACEHOLDER:
+        return env_val
+    return None
+
+
+def _clean_run_id(value):
+    """Normalize a run-id candidate: empty / PLACEHOLDER -> None."""
+    if value and value != PLACEHOLDER:
+        return value
+    return None
+
+
+def _resolve_parent_run_id(flag):
+    """Resolve the parent run id that the child reports step completion to.
+
+    The child reports step completion to this run id, so it MUST name the live
+    foreman. Order (first wins):
+      1. --parent-run-id flag (PREFERRED — explicit current foreman run id)
+      2. CURRENT_RUN_ID env (the runtime-provided / current foreman run id)
+      3. OZ_RUN_ID env (worker-injected at launch; may be STALE after a resume
+         / follow-up and name an older foreman run)
+
+    A real dispatch fails before emitting a payload if this is unresolved. When
+    these signals disagree, warn loudly: a stale $OZ_RUN_ID (or a wrong explicit
+    value) would make the child report completion to the wrong foreman.
+    """
+    flag_val = _clean_run_id(flag)
+    current_val = _clean_run_id(os.environ.get("CURRENT_RUN_ID"))
+    oz_val = _clean_run_id(os.environ.get("OZ_RUN_ID"))
+
+    if flag_val is not None:
+        resolved, source = flag_val, "--parent-run-id"
+    elif current_val is not None:
+        resolved, source = current_val, "$CURRENT_RUN_ID"
+    elif oz_val is not None:
+        resolved, source = oz_val, "$OZ_RUN_ID"
+    else:
+        return None
+
+    _warn_parent_run_id_divergence(resolved, source, flag_val, current_val, oz_val)
+    return resolved
+
+
+def _warn_parent_run_id_divergence(resolved, source, flag_val, current_val, oz_val):
+    """Warn when the parent-run-id signals disagree.
+
+    Guards the failure where the child reports to a stale foreman: $OZ_RUN_ID is
+    set only at launch, so after a resume / follow-up it can name an older run.
+    We compare it (and any explicit flag) against the runtime current id and warn
+    on any divergence, naming which id is actually being used.
+    """
+    distinct = {v for v in (flag_val, current_val, oz_val) if v is not None}
+    if len(distinct) <= 1:
+        return
+    # The classic stale case: $OZ_RUN_ID disagrees with the runtime current id.
+    if current_val is not None and oz_val is not None and oz_val != current_val:
+        _warn(
+            f"$OZ_RUN_ID ({oz_val}) differs from the runtime current run id "
+            f"$CURRENT_RUN_ID ({current_val}) and looks stale."
+        )
+    # An explicit value that disagrees with the runtime current id.
+    if flag_val is not None and current_val is not None and flag_val != current_val:
+        _warn(
+            f"--parent-run-id ({flag_val}) differs from the runtime current run "
+            f"id $CURRENT_RUN_ID ({current_val})."
+        )
+    _warn(
+        f"using {resolved} (from {source}) as the parent run id; the child will "
+        f"report step completion to that run. If it is not the current foreman, "
+        f"pass --parent-run-id explicitly with the foreman's current run id."
+    )
+
+
+def _build_child_prompt(prompt, parent_run_id):
+    """Build the per-child run_agents prompt (task brief + coordination footer).
+
+    The coordination footer is only added when a parent run id is resolved so the
+    child knows which run to report completion to. Without a parent run id the
+    footer would name no foreman, so it is omitted. The track playbook is NOT
+    included here — it is emitted separately as the shared base_prompt.
+    """
+    if not parent_run_id:
+        return prompt
+    return prompt + COORDINATION_FOOTER.format(parent_run_id=parent_run_id)
+
+
+def _resolve_api_url(flag):
+    """Resolve and validate the API-shaped URL used to derive the Oz web origin.
+
+    No request is ever made to it; it is only mapped to the Oz web host that
+    serves the child's /runs/<id> page (see _oz_web_origin). Order: --api-url ->
+    FACTORY_FOREMAN_API_URL -> the production default.
+    """
+    value = flag or os.environ.get("FACTORY_FOREMAN_API_URL") or DEFAULT_API_URL
+    value = value.rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        _die(f"invalid API URL {value!r}; expected an http(s) URL")
+    return value
+
+
+def _build_run_agents_payload(
+    skill,
+    base_prompt,
+    child_prompt,
+    model,
+    environment_id,
+    name,
+    track,
+    computer_use_enabled,
+):
+    """Compose the run_agents tool-call arguments for one factory child step.
+
+    The foreman calls the run_agents tool with this payload verbatim (a single
+    agent_run_configs entry for a single-child dispatch). Run-wide fields
+    (skills, model_id, remote) are shared; the per-child prompt carries the task
+    brief + coordination footer.
+    """
+    remote = {"computer_use_enabled": computer_use_enabled}
+    if environment_id:
+        remote["environment_id"] = environment_id
+    agent_run_config = {
+        "name": name or f"factory-{track}",
+        "title": f"factory {track}",
+        "prompt": child_prompt,
+    }
+    payload = {
+        "summary": (
+            f"Dispatch the factory {track} child step for the current request."
+        ),
+        "base_prompt": base_prompt,
+        "skills": [{"spec": skill}],
+        "remote": remote,
+        "agent_run_configs": [agent_run_config],
+    }
+    if model:
+        payload["model_id"] = model
+    return payload
+
+
+# The public runs API and the Oz web app are served from DIFFERENT hosts: the
+# API lives on e.g. staging.warp.dev / app.warp.dev, while the run page the Slack
+# / Jira integrations link to (and humans open) lives on the Oz web host —
+# oz.staging.warp.dev / oz.warp.dev. Deriving the web link straight from the API
+# origin yields a 404, so map known API hosts to their Oz web host.
+OZ_WEB_HOST_BY_API_HOST = {
+    "staging.warp.dev": "oz.staging.warp.dev",
+    "app.warp.dev": "oz.warp.dev",
+}
+
+
+def _oz_web_origin(api_url):
+    """Map the API URL's origin to the Oz web origin that serves /runs/<id>.
+
+    The runs API and the Oz web app live on different hosts (see
+    OZ_WEB_HOST_BY_API_HOST). For a known API host we return its mapped Oz web
+    host; for anything else (custom deploy / localhost) we fall back to the API
+    origin unchanged so local development keeps working.
+    """
+    parsed = urlparse(api_url)
+    web_host = OZ_WEB_HOST_BY_API_HOST.get(parsed.netloc, parsed.netloc)
+    return f"{parsed.scheme}://{web_host}"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="factory-dispatch",
+        description=(
+            "Resolve the run_agents tool-call parameters for one factory child "
+            "step, applying the track's config (skill + model). "
+            "Resolves config per track from <track>/config.json + the "
+            "shared environment from the agent environment variable "
+            "$FACTORY_FOREMAN_ENV (flag -> env var), names the run "
+            "FA_<track>_<UTC timestamp>, and emits "
+            "{track,skill,model,name,environment_id,"
+            "computer_use_enabled,parent_run_id,"
+            "oz_web_origin,run_link_template,run_agents} as JSON. The foreman "
+            "then CALLS the run_agents tool with the emitted `run_agents` "
+            "payload; this script makes NO API call. Mechanics only: the "
+            "foreman decides the track."
+        ),
+    )
+    parser.add_argument(
+        "--api-url",
+        help=(
+            "API-shaped URL used ONLY to derive the Oz web origin for the "
+            "child's run link (no request is made). Defaults to "
+            "$FACTORY_FOREMAN_API_URL, then the production endpoint."
+        ),
+    )
+    parser.add_argument(
+        "--track",
+        required=True,
+        choices=TRACKS,
+        help="Which subagent to route to.",
+    )
+    parser.add_argument(
+        "--prompt",
+        required=True,
+        help=(
+            "The task brief handed to the child run (verbatim request + "
+            "context). The track's <track>/AGENTS.md playbook is emitted "
+            "as the shared base_prompt and the coordination footer is appended "
+            "to the per-child prompt."
+        ),
+    )
+    parser.add_argument(
+        "--name",
+        help=(
+            "Optional human-readable name for the child run. When omitted, the "
+            "run is named FA_<track>_<UTC timestamp> "
+            "(e.g. FA_triage_2024-04-15T14:30)."
+        ),
+    )
+    parser.add_argument(
+        "--skill",
+        help="Override the resolved base skill for this track.",
+    )
+    parser.add_argument(
+        "--model",
+        help="Override the resolved base model for this track.",
+    )
+    parser.add_argument(
+        "--environment",
+        help="Override the resolved (shared) environment id for this run.",
+    )
+    parser.add_argument(
+        "--parent-run-id",
+        help=(
+            "The foreman run id the child reports step completion to (embedded "
+            "in the coordination footer). PREFERRED: pass the foreman's current "
+            "run id explicitly. Falls back to $CURRENT_RUN_ID, then $OZ_RUN_ID "
+            "(which is set only at launch and may be stale). Required for a real "
+            "dispatch."
+        ),
+    )
+    parser.add_argument(
+        "--computer-use",
+        dest="computer_use",
+        action="store_true",
+        default=True,
+        help=(
+            "Enable the computer_use tool for the child run (DEFAULT). Factory "
+            "children need it to reproduce/validate user-facing changes and "
+            "capture screenshot proof per factory-verification; the run_agents "
+            "tool otherwise defaults computer use off."
+        ),
+    )
+    parser.add_argument(
+        "--no-computer-use",
+        dest="computer_use",
+        action="store_false",
+        help=(
+            "Disable the computer_use tool for the child run. Use only for a run "
+            "that genuinely cannot have a user-facing effect to validate."
+        ),
+    )
+    args = parser.parse_args()
+
+    config = _load_config(args.track)
+    skill = _resolve_skill(args.track, args.skill, config)
+    if not skill:
+        key = _env_key(args.track)
+        _die(
+            f"no base skill for track {args.track!r}: set --skill, "
+            f"$FACTORY_FOREMAN_{key}_SKILL, or agent.entrypoint_skill + "
+            f"repos.self in {_config_path(args.track)}"
+        )
+    model = _resolve_model(args.track, args.model, config)
+    run_name = _build_run_name(args.name, args.track)
+    environment_id = _resolve_environment(args.environment)
+    parent_run_id = _resolve_parent_run_id(args.parent_run_id)
+    if not parent_run_id:
+        _die(
+            "no parent run id: pass --parent-run-id (preferred) with the "
+            "foreman's current run id, or ensure $CURRENT_RUN_ID / $OZ_RUN_ID "
+            "contains the dispatching foreman's run id"
+        )
+    api_url = _resolve_api_url(args.api_url)
+    oz_web_origin = _oz_web_origin(api_url)
+    base_prompt = _build_base_prompt(args.track)
+    child_prompt = _build_child_prompt(args.prompt, parent_run_id)
+    run_agents = _build_run_agents_payload(
+        skill,
+        base_prompt,
+        child_prompt,
+        model,
+        environment_id,
+        run_name,
+        args.track,
+        args.computer_use,
+    )
+
+    result = {
+        "track": args.track,
+        "skill": skill,
+        "model": model,
+        "name": run_name,
+        "environment_id": environment_id,
+        "computer_use_enabled": args.computer_use,
+        "parent_run_id": parent_run_id,
+        "oz_web_origin": oz_web_origin,
+        "run_link_template": f"{oz_web_origin}/runs/{{run_id}}",
+        "run_agents": run_agents,
+    }
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

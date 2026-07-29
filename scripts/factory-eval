@@ -1,0 +1,888 @@
+#!/usr/bin/env python3
+"""factory-eval - benchmark a factory track by launching N Oz runs over a task list.
+
+Given a track (triage / spec / implementation / code-review), a run count N, and
+an optional model override, this launches N cloud Oz runs round-robin over the
+track's task list (evals/tasks/<track>.jsonl), polls each to a terminal state,
+normalizes the results (state, run time, cost, artifacts) into a CSV under
+evals/results/, prints a batch-summary JSON object to stdout, and optionally
+cleans up the artifacts the runs created (prefix titles with [Test] and close
+them).
+
+It reuses the dispatch mechanics of scripts/factory-dispatch (per-track skill +
+model from <track>/config.json, the same curl-based Oz public API flow,
+and the same API-host -> Oz-web-host link mapping) but runs each task as a
+STANDALONE run: skill + model are applied inline, with no agent_identity_uid and
+no parent_run_id / foreman coordination footer.
+
+Design decisions (not spelled out verbatim in the plan):
+  * The child brief is the task prompt as-is. Unlike factory-dispatch we do NOT
+    prepend the track's AGENTS.md playbook; the resolved `skill` (the track's
+    SKILL.md) is the entrypoint. This keeps the eval request minimal and matches
+    the approved plan's request shape. Set the brief in the task file if a task
+    needs more standing context.
+  * Cleanup discovery for the tracker is deterministic via the PR metadata
+    block (factory-pr-meta read -> tracker_issue_id); there is no prompt
+    injection. A run with no PR (e.g. triage) has no metadata to trace, so its
+    tracker issue is recorded but not auto-cleaned (reported for manual
+    cleanup).
+
+Authentication uses $WARP_API_KEY (an Oz cloud API key), read only from the
+local environment. If it is unset the script exits with an error; it is never
+prompted for or fetched via a command during a run. The key is never written to
+argv or logs (curl reads it from a stdin config, like factory-dispatch).
+
+Cleanup mutates shared state (closes PRs, cancels tracker issues), so it is
+PREVIEW-ONLY by default; pass --apply-cleanup to actually mutate.
+
+Python 3 stdlib + curl (+ gh / scripts for cleanup) only.
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+AGENTS_DIR = REPO_ROOT
+TASKS_DIR = os.path.join(REPO_ROOT, "evals", "tasks")
+RESULTS_DIR = os.path.join(REPO_ROOT, "evals", "results")
+
+# Sibling deterministic mechanics reused for cleanup. Tracker cleanup goes
+# through the provider-agnostic seam (scripts/tracker), so it works with the
+# jira provider and the eval mock alike (select via FACTORY_TRACKER_PROVIDER).
+PR_META = os.path.join(SCRIPT_DIR, "factory-pr-meta")
+TRACKER = os.path.join(SCRIPT_DIR, "tracker")
+
+TRACKS = ("triage", "spec", "implementation", "code-review")
+PLACEHOLDER = "REPLACE_ME"
+DEFAULT_API_URL = "https://app.warp.dev/api/v1/agent/runs"
+
+# Run states (mirrors the public API RunState enum). Terminal states end polling.
+TERMINAL_STATES = {"SUCCEEDED", "FAILED", "BLOCKED", "ERROR", "CANCELLED"}
+CANCELED_STATE = "Canceled"
+TEST_PREFIX = "[Test] "
+
+# The CSV is the flattened per-run record; task_prompt is kept in the JSON record
+# but omitted here to keep rows readable. Keep this column order stable.
+CSV_COLUMNS = [
+    "batch_timestamp", "track", "model", "task_id", "run_id", "run_link",
+    "state", "success", "run_time_iso", "run_time_seconds", "wall_time_seconds",
+    "created_at", "started_at", "updated_at",
+    "inference_cost", "compute_cost", "platform_cost", "total_cost",
+    "num_artifacts", "pr_urls", "plan_urls", "tracker_issue_ids", "tracker_urls",
+    "error_code", "status_message", "cleanup_status", "cleaned_up",
+]
+LIST_COLUMNS = {"pr_urls", "plan_urls", "tracker_issue_ids", "tracker_urls"}
+
+# The runs API and the Oz web app live on different hosts; map known API hosts to
+# their Oz web host so the run link resolves (mirrors factory-dispatch).
+OZ_WEB_HOST_BY_API_HOST = {
+    "staging.warp.dev": "oz.staging.warp.dev",
+    "app.warp.dev": "oz.warp.dev",
+}
+
+
+def _die(msg):
+    print(f"factory-eval: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _warn(msg):
+    print(f"factory-eval: warning: {msg}", file=sys.stderr)
+
+
+def _log(msg):
+    """Progress line to stderr (stdout is reserved for the batch summary JSON)."""
+    print(f"factory-eval: {msg}", file=sys.stderr)
+
+
+def _env_key(track):
+    return track.upper().replace("-", "_")
+
+
+def _clean(value):
+    """A flag/env/config value, or None when unset or the REPLACE_ME placeholder."""
+    return value if value and value != PLACEHOLDER else None
+
+
+# ---------------------------------------------------------------------------
+# Config resolution (reused from factory-dispatch)
+# ---------------------------------------------------------------------------
+
+def _load_config(track):
+    path = os.path.join(AGENTS_DIR, track, "config.json")
+    if not os.path.isfile(path):
+        _die(f"no config for track {track!r}: expected {path}")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read {track} config {path}: {e}")
+    if not isinstance(data, dict):
+        _die(f"{track} config {path} must be a JSON object")
+    return data
+
+
+def _derive_skill(track, config, flag):
+    """Resolve the base skill: --skill flag, else derived from the track config.
+
+    Derived form mirrors factory-dispatch:
+      <repos.self>:<track>/.agents/skills/<agent.entrypoint_skill>/SKILL.md
+    """
+    flag = _clean(flag)
+    if flag:
+        return flag
+    agent = config.get("agent")
+    entry = _clean(agent.get("entrypoint_skill")) if isinstance(agent, dict) else None
+    repos = config.get("repos")
+    repo = _clean(repos.get("self")) if isinstance(repos, dict) else None
+    if not entry or not repo:
+        _die(
+            f"no base skill for track {track!r}: set agent.entrypoint_skill + "
+            f"repos.self in {track}/config.json, or pass --skill"
+        )
+    return f"{repo}:{track}/.agents/skills/{entry}/SKILL.md"
+
+
+def _resolve_model(track, flag, config):
+    """Resolve the model: --model flag -> env override -> track config.
+
+    Returns None when unresolved (the API default applies). The track config's
+    `model` must be a plain model-id string; anything else is ignored with a
+    warning and the API default applies.
+    """
+    resolved = _clean(flag) or _clean(
+        os.environ.get(f"FACTORY_FOREMAN_{_env_key(track)}_MODEL")
+    )
+    if resolved:
+        return resolved
+    val = config.get("model")
+    if isinstance(val, dict):
+        _warn(
+            f"track {track!r} config 'model' must be a plain model-id string - "
+            "using the API default (pin a model with --model or --models)"
+        )
+        return None
+    return _clean(val)
+
+
+def _resolve_environment(flag):
+    return _clean(flag) or _clean(os.environ.get("FACTORY_FOREMAN_ENV"))
+
+
+def _resolve_api_url(flag):
+    value = (
+        _clean(flag)
+        or _clean(os.environ.get("FACTORY_FOREMAN_API_URL"))
+        or DEFAULT_API_URL
+    )
+    value = value.rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        _die(f"invalid API URL {value!r}; expected an http(s) URL")
+    return value
+
+
+def _resolve_api_key():
+    """Resolve $WARP_API_KEY (an Oz Cloud API key) from the local environment only.
+
+    The key is read exclusively from $WARP_API_KEY (e.g. a Warp Drive env var
+    loaded into the session). It is never prompted for or fetched via a command
+    during a run. Never logged/echoed.
+    """
+    value = os.environ.get("WARP_API_KEY")
+    if not value:
+        _die("$WARP_API_KEY is not set. Export it in your shell before running.")
+    if "\n" in value or "\r" in value:
+        _die("$WARP_API_KEY contains an invalid newline")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+def _default_tasks_file(track):
+    return os.path.join(TASKS_DIR, f"{track}.jsonl")
+
+
+def _load_tasks(path):
+    """Load a JSONL task list: one object per line, each with a non-empty prompt.
+
+    `id` is optional and defaults to the 1-based line index.
+    """
+    if not os.path.isfile(path):
+        _die(f"tasks file not found: {path}")
+    tasks = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for lineno, raw in enumerate(fh, start=1):
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    _die(f"{path}:{lineno}: invalid JSON: {e}")
+                if not isinstance(obj, dict):
+                    _die(f"{path}:{lineno}: expected a JSON object")
+                prompt = (obj.get("prompt") or "").strip()
+                if not prompt:
+                    _die(f"{path}:{lineno}: missing non-empty 'prompt'")
+                tasks.append({"id": str(obj.get("id") or f"task-{lineno}"), "prompt": prompt})
+    except OSError as e:
+        _die(f"could not read tasks file {path}: {e}")
+    if not tasks:
+        _die(f"no tasks found in {path}")
+    return tasks
+
+
+def _parse_models(spec):
+    """Parse a comma-separated model list, preserving order and dropping blanks."""
+    return [m.strip() for m in (spec or "").split(",") if m.strip()]
+
+
+def _select_single_task(tasks_file, task_id, prompt):
+    """Resolve the single request used in compare-models mode.
+
+    Order: an inline --prompt, else --task-id looked up in the tasks file, else
+    the sole task when the file has exactly one. Otherwise fail asking for one.
+    """
+    if prompt and prompt.strip():
+        return {"id": (task_id or "inline"), "prompt": prompt.strip()}
+    tasks = _load_tasks(tasks_file)
+    if task_id:
+        for t in tasks:
+            if t["id"] == task_id:
+                return t
+        _die(f"task id {task_id!r} not found in {tasks_file}")
+    if len(tasks) == 1:
+        return tasks[0]
+    _die(
+        "compare-models mode: choose the single request with --task-id <id> or "
+        f"--prompt <text> ({len(tasks)} tasks in {tasks_file})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess + curl transport (auth via stdin config, mirrors factory-dispatch)
+# ---------------------------------------------------------------------------
+
+def _run(argv, input_text=None):
+    """Run a subprocess; return (returncode, stdout, stderr). rc=127 if missing."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, input=input_text)
+    except FileNotFoundError:
+        return 127, "", f"not found: {argv[0]}"
+    return p.returncode, p.stdout, p.stderr
+
+
+def _detail(out, err, limit=160):
+    """Short human-readable detail from a subprocess' output streams."""
+    return (err.strip() or out.strip() or "(no output)")[:limit]
+
+
+def _build_curl_argv(method, url, payload=None):
+    argv = [
+        "curl", "--silent", "--show-error", "--fail-with-body",
+        "--request", method, "--header", "Content-Type: application/json",
+        "--config", "-",
+    ]
+    if payload is not None:
+        argv += ["--data-binary", json.dumps(payload, separators=(",", ":"))]
+    argv.append(url)
+    return argv
+
+
+def _run_curl(method, url, api_key, payload=None):
+    """Call the Oz API; return (returncode, stdout, stderr). Auth never hits argv."""
+    argv = _build_curl_argv(method, url, payload)
+    rc, out, err = _run(argv, input_text=f'header = "Authorization: Bearer {api_key}"\n')
+    if rc == 127:
+        _die("`curl` not found on PATH; cannot talk to the Oz API")
+    return rc, out, err
+
+
+def _extract(field_names, payload):
+    """Pull the first present key from a (possibly nested) API JSON payload."""
+    stack = [payload]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for key in field_names:
+                if cur.get(key):
+                    return cur[key]
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def _oz_web_origin(api_url):
+    parsed = urlparse(api_url)
+    web_host = OZ_WEB_HOST_BY_API_HOST.get(parsed.netloc, parsed.netloc)
+    return f"{parsed.scheme}://{web_host}"
+
+
+def _run_link(api_url, run_id):
+    return f"{_oz_web_origin(api_url)}/runs/{run_id}"
+
+
+# ---------------------------------------------------------------------------
+# Request building + normalization
+# ---------------------------------------------------------------------------
+
+def _build_request(skill, prompt, model, environment_id, name, computer_use):
+    config = {"name": name, "computer_use_enabled": computer_use}
+    if model:
+        config["model_id"] = model
+    if environment_id:
+        config["environment_id"] = environment_id
+    return {"prompt": prompt, "skill": skill, "config": config}
+
+
+_ISO_DUR = re.compile(
+    r"^P(?:(?P<d>\d+(?:\.\d+)?)D)?"
+    r"(?:T(?:(?P<h>\d+(?:\.\d+)?)H)?(?:(?P<m>\d+(?:\.\d+)?)M)?(?:(?P<s>\d+(?:\.\d+)?)S)?)?$"
+)
+
+
+def _parse_iso8601_duration(text):
+    """Parse an ISO-8601 duration like 'PT2M30S' into float seconds, or None."""
+    if not text or not isinstance(text, str):
+        return None
+    m = _ISO_DUR.match(text.strip())
+    if not m:
+        return None
+    parts = m.groupdict()
+    if not any(parts.values()):
+        return None
+    total = 0.0
+    total += float(parts["d"] or 0) * 86400
+    total += float(parts["h"] or 0) * 3600
+    total += float(parts["m"] or 0) * 60
+    total += float(parts["s"] or 0)
+    return total
+
+
+def _parse_rfc3339(text):
+    if not text or not isinstance(text, str):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _wall_seconds(created_at, updated_at):
+    a = _parse_rfc3339(created_at)
+    b = _parse_rfc3339(updated_at)
+    if a and b:
+        return max(0.0, (b - a).total_seconds())
+    return None
+
+
+def _new_record(batch_timestamp, track, model, task, run_id, run_link):
+    """A record pre-filled with defaults so every CSV column is always present."""
+    return {
+        "batch_timestamp": batch_timestamp, "track": track, "model": model or "",
+        "task_id": task["id"], "task_prompt": task["prompt"],
+        "run_id": run_id or "", "run_link": run_link or "",
+        "state": "", "success": False, "run_time_iso": "",
+        "run_time_seconds": None, "wall_time_seconds": None,
+        "created_at": "", "started_at": "", "updated_at": "",
+        "inference_cost": 0.0, "compute_cost": 0.0, "platform_cost": 0.0,
+        "total_cost": 0.0, "num_artifacts": 0,
+        "pr_urls": [], "plan_urls": [], "tracker_issue_ids": [], "tracker_urls": [],
+        "error_code": "", "status_message": "",
+        "cleanup_status": "skipped", "cleaned_up": False,
+        "timed_out": False,
+    }
+
+
+def _apply_run_item(record, item, api_url):
+    """Fill a record from a RunItem payload (GET /agent/runs/{id})."""
+    record["state"] = item.get("state") or record["state"]
+    record["success"] = record["state"] == "SUCCEEDED"
+    record["created_at"] = item.get("created_at") or record["created_at"]
+    record["started_at"] = item.get("started_at") or record["started_at"]
+    record["updated_at"] = item.get("updated_at") or record["updated_at"]
+    record["run_time_iso"] = item.get("run_time") or record["run_time_iso"]
+    secs = _parse_iso8601_duration(record["run_time_iso"])
+    if secs is not None:
+        record["run_time_seconds"] = secs
+    wall = _wall_seconds(record["created_at"], record["updated_at"])
+    if wall is not None:
+        record["wall_time_seconds"] = wall
+
+    usage = item.get("request_usage") or {}
+    record["inference_cost"] = float(usage.get("inference_cost") or 0.0)
+    record["compute_cost"] = float(usage.get("compute_cost") or 0.0)
+    record["platform_cost"] = float(usage.get("platform_cost") or 0.0)
+    record["total_cost"] = (
+        record["inference_cost"] + record["compute_cost"] + record["platform_cost"]
+    )
+
+    status = item.get("status_message") or {}
+    record["status_message"] = status.get("message") or record["status_message"]
+    record["error_code"] = status.get("error_code") or record["error_code"]
+
+    artifacts = item.get("artifacts") or []
+    record["num_artifacts"] = len(artifacts)
+    for art in artifacts:
+        data = art.get("data") or {}
+        url = data.get("url")
+        atype = art.get("artifact_type")
+        if atype == "PULL_REQUEST" and url:
+            record["pr_urls"].append(url)
+        elif atype == "PLAN" and url:
+            record["plan_urls"].append(url)
+    if not record["run_link"] and record["run_id"]:
+        record["run_link"] = _run_link(api_url, record["run_id"])
+
+
+# ---------------------------------------------------------------------------
+# Launch + poll (one run per worker; concurrency bounds in-flight runs)
+# ---------------------------------------------------------------------------
+
+def _process_run(ctx, idx, item):
+    task, model = item["task"], item["model"]
+    name = f"{ctx['eval_tag']}#{idx + 1}"
+    record = _new_record(ctx["batch_timestamp"], ctx["track"], model, task, None, None)
+
+    request = _build_request(
+        ctx["skill"], task["prompt"], model, ctx["environment_id"], name,
+        ctx["computer_use"],
+    )
+    _log(f"[{name}] launching {task['id']} ...")
+    rc, out, err = _run_curl("POST", ctx["api_url"], ctx["api_key"], request)
+    if rc != 0:
+        detail = _detail(out, err, limit=300)
+        _warn(f"[{name}] launch failed: {detail}")
+        record["state"] = "LAUNCH_FAILED"
+        record["status_message"] = detail
+        return record
+
+    try:
+        payload = json.loads(out.strip())
+    except json.JSONDecodeError:
+        payload = {}
+    run_id = _extract(("run_id", "task_id"), payload)
+    if not run_id:
+        _warn(f"[{name}] no run id in launch response")
+        record["state"] = "LAUNCH_FAILED"
+        record["status_message"] = "no run id in launch response"
+        return record
+
+    record["run_id"] = run_id
+    record["run_link"] = _run_link(ctx["api_url"], run_id)
+    _log(f"[{name}] run {run_id} -> {record['run_link']}")
+
+    _poll(ctx, name, record)
+    return record
+
+
+def _poll(ctx, name, record):
+    """Poll GET /agent/runs/{id} until terminal or timeout; fill the record."""
+    get_url = f"{ctx['api_url']}/{record['run_id']}"
+    deadline = time.monotonic() + ctx["timeout"]
+    last_state = None
+    while True:
+        rc, out, err = _run_curl("GET", get_url, ctx["api_key"])
+        if rc == 0:
+            try:
+                item = json.loads(out.strip())
+            except json.JSONDecodeError:
+                item = None
+            if item:
+                _apply_run_item(record, item, ctx["api_url"])
+                if record["state"] != last_state:
+                    _log(f"[{name}] {record['run_id']} state={record['state']}")
+                    last_state = record["state"]
+                if record["state"] in TERMINAL_STATES:
+                    return
+        else:
+            _warn(f"[{name}] poll error (transient): {_detail(out, err)}")
+
+        if time.monotonic() >= deadline:
+            record["timed_out"] = True
+            _warn(f"[{name}] timed out after {ctx['timeout']}s in state "
+                  f"{record['state'] or 'UNKNOWN'}")
+            if ctx["cancel_on_timeout"] and record["run_id"]:
+                _cancel_run(ctx, name, record["run_id"])
+                # Best-effort final refresh so the CSV reflects the cancel.
+                rc, out, _err = _run_curl("GET", get_url, ctx["api_key"])
+                if rc == 0:
+                    try:
+                        _apply_run_item(record, json.loads(out.strip()), ctx["api_url"])
+                    except json.JSONDecodeError:
+                        pass
+            return
+        time.sleep(ctx["poll_interval"])
+
+
+def _cancel_run(ctx, name, run_id):
+    _log(f"[{name}] cancelling {run_id} (timeout)")
+    rc, out, err = _run_curl("POST", f"{ctx['api_url']}/{run_id}/cancel", ctx["api_key"])
+    if rc != 0:
+        _warn(f"[{name}] cancel failed: {_detail(out, err)}")
+
+
+# ---------------------------------------------------------------------------
+# Cleanup (PR via gh; tracker via PR metadata). Preview unless apply=True.
+# ---------------------------------------------------------------------------
+
+def _read_pr_meta(pr_url):
+    rc, out, err = _run([PR_META, "read", "--pr", pr_url])
+    if rc != 0:
+        _warn(f"factory-pr-meta read failed for {pr_url}: {_detail(out, err)}")
+        return {}
+    try:
+        return json.loads(out or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def _cleanup_pr(pr_url, apply_changes):
+    rc, out, err = _run(["gh", "pr", "view", pr_url, "--json", "title"])
+    if rc != 0:
+        raise RuntimeError(f"gh pr view failed: {_detail(out, err)}")
+    title = (json.loads(out or "{}").get("title") or "").strip()
+    if not title.startswith(TEST_PREFIX.strip()):
+        new_title = TEST_PREFIX + title
+        _log(f"  PR {pr_url}: retitle -> {new_title}"
+             + ("" if apply_changes else " (preview)"))
+        if apply_changes:
+            rc, out, err = _run(["gh", "pr", "edit", pr_url, "--title", new_title])
+            if rc != 0:
+                raise RuntimeError(f"gh pr edit failed: {_detail(out, err)}")
+    else:
+        _log(f"  PR {pr_url}: title already [Test]-prefixed")
+    _log(f"  PR {pr_url}: close" + ("" if apply_changes else " (preview)"))
+    if apply_changes:
+        rc, out, err = _run(["gh", "pr", "close", pr_url])
+        if rc != 0 and "closed" not in (err or "").lower():
+            raise RuntimeError(f"gh pr close failed: {_detail(out, err)}")
+
+
+def _cleanup_tracker(issue_id, apply_changes):
+    rc, out, err = _run([TRACKER, "get-issue", issue_id])
+    if rc != 0:
+        raise RuntimeError(f"tracker get-issue failed: {_detail(out, err)}")
+    title = (json.loads(out or "{}").get("title") or "").strip()
+    argv = [TRACKER, "update-issue", issue_id, "--status", CANCELED_STATE]
+    if not title.startswith(TEST_PREFIX.strip()):
+        argv += ["--title", TEST_PREFIX + title]
+        _log(f"  tracker {issue_id}: retitle -> {TEST_PREFIX + title} + Cancel"
+             + ("" if apply_changes else " (preview)"))
+    else:
+        _log(f"  tracker {issue_id}: Cancel (title already [Test]-prefixed)"
+             + ("" if apply_changes else " (preview)"))
+    if apply_changes:
+        rc, out, err = _run(argv)
+        if rc != 0:
+            raise RuntimeError(f"tracker update-issue failed: {_detail(out, err)}")
+
+
+def _cleanup(records, apply_changes):
+    """Prefix [Test] + close each run's PRs and their metadata-linked tracker issues.
+
+    Preview-only unless apply_changes. Always reads PR metadata (non-destructive)
+    so tracker_issue_ids/urls land in the CSV even in preview mode.
+    """
+    have_gh = shutil.which("gh") is not None
+    mode = "apply" if apply_changes else "preview"
+    _log(f"cleanup ({mode}) ...")
+    for rec in records:
+        prs = rec["pr_urls"]
+        if not prs:
+            rec["cleanup_status"] = "skipped"
+            continue
+        if not have_gh:
+            _warn(f"[{rec['run_id']}] gh not found; skipping PR/tracker cleanup")
+            rec["cleanup_status"] = "skipped"
+            continue
+        try:
+            for pr_url in prs:
+                _cleanup_pr(pr_url, apply_changes)
+                meta = _read_pr_meta(pr_url)
+                issue_id = meta.get("tracker_issue_id")
+                task_url = meta.get("task_url")
+                if issue_id and issue_id not in rec["tracker_issue_ids"]:
+                    rec["tracker_issue_ids"].append(issue_id)
+                if task_url and task_url not in rec["tracker_urls"]:
+                    rec["tracker_urls"].append(task_url)
+                if issue_id:
+                    _cleanup_tracker(issue_id, apply_changes)
+            rec["cleanup_status"] = "applied" if apply_changes else "preview"
+            rec["cleaned_up"] = bool(apply_changes)
+        except Exception as e:  # non-fatal: never lose the CSV over cleanup
+            _warn(f"[{rec['run_id']}] cleanup failed: {e}")
+            rec["cleanup_status"] = "failed"
+
+
+# ---------------------------------------------------------------------------
+# Output: CSV + batch summary
+# ---------------------------------------------------------------------------
+
+def _csv_value(record, col):
+    val = record.get(col)
+    if col in LIST_COLUMNS:
+        return ";".join(val or [])
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if val is None:
+        return ""
+    return val
+
+
+def _append_csv(path, records):
+    """Append run rows to the per-track CSV, creating it (with header) if absent.
+
+    The header is written only for a new/empty file. If an existing file's header
+    does not match the current columns the run aborts (no schema migration).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    existing_header = None
+    exists = os.path.isfile(path)
+    if exists:
+        with open(path, newline="", encoding="utf-8") as fh:
+            existing_header = next(csv.reader(fh), None)
+        if existing_header is not None and existing_header != CSV_COLUMNS:
+            _die(
+                f"CSV schema mismatch in {path}: existing header does not match the "
+                f"current columns. Move or remove the file and re-run."
+            )
+    write_header = existing_header is None
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        if write_header:
+            writer.writerow(CSV_COLUMNS)
+        for rec in records:
+            writer.writerow([_csv_value(rec, col) for col in CSV_COLUMNS])
+
+
+def _median(values):
+    vals = [v for v in values if v is not None]
+    return statistics.median(vals) if vals else None
+
+
+def _mean(values):
+    vals = [v for v in values if v is not None]
+    return statistics.fmean(vals) if vals else None
+
+
+def _summary(records, meta):
+    states = [r["state"] for r in records]
+    succeeded = sum(1 for r in records if r["success"])
+    run_times = [r["run_time_seconds"] for r in records]
+    total_cost = sum(r["total_cost"] for r in records)
+    success_costs = [r["total_cost"] for r in records if r["success"]]
+    completed = sum(1 for s in states if s in TERMINAL_STATES)
+    models = {r["model"] for r in records if r["model"]}
+    summary = dict(meta)
+    summary["model"] = meta.get("model") or (next(iter(models)) if len(models) == 1 else "mixed")
+    summary["counts"] = {
+        "requested": len(records),
+        "launched": sum(1 for r in records if r["run_id"]),
+        "completed": completed,
+        "succeeded": succeeded,
+        "failed": sum(1 for s in states if s == "FAILED"),
+        "errored": sum(1 for s in states if s == "ERROR"),
+        "blocked": sum(1 for s in states if s == "BLOCKED"),
+        "cancelled": sum(1 for s in states if s == "CANCELLED"),
+        "timed_out": sum(1 for r in records if r.get("timed_out")),
+        "launch_failed": sum(1 for s in states if s == "LAUNCH_FAILED"),
+    }
+    summary["aggregates"] = {
+        "success_rate": (succeeded / len(records)) if records else 0.0,
+        "avg_run_time_seconds": _mean(run_times),
+        "median_run_time_seconds": _median(run_times),
+        "total_cost": total_cost,
+        "avg_cost_per_run": (total_cost / len(records)) if records else 0.0,
+        "avg_cost_per_success": _mean(success_costs),
+    }
+    return summary
+
+
+def _iso_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _default_out(track):
+    return os.path.join(RESULTS_DIR, f"{track}.csv")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _build_parser():
+    p = argparse.ArgumentParser(
+        prog="factory-eval",
+        description=(
+            "Launch N Oz runs for a factory track over its task list, record "
+            "normalized results (state, run time, cost, artifacts) to CSV, print a "
+            "batch summary, and optionally clean up created artifacts."
+        ),
+    )
+    p.add_argument("--track", required=True, choices=TRACKS, help="Which track to evaluate.")
+    p.add_argument("--runs", type=int, default=None,
+                   help="Standard mode: total runs, round-robin over the task list (required).")
+    p.add_argument("--reps", type=int, default=None,
+                   help="Compare-models mode: repetitions per model (default 1).")
+    p.add_argument("--model", help="Model id override for every run (else the track config).")
+    p.add_argument("--models",
+                   help="Comma-separated model ids to fan ONE request across (compare-models "
+                        "mode): one run per model, x --reps. Mutually exclusive with --model.")
+    p.add_argument("--prompt", help="Inline task prompt for the single compare-models request.")
+    p.add_argument("--task-id", dest="task_id",
+                   help="Task id from the tasks file to use as the single compare-models request.")
+    p.add_argument("--skill", help="Base skill override (else derived from the track config).")
+    p.add_argument("--tasks-file", help="Task list path (default evals/tasks/<track>.jsonl).")
+    p.add_argument("--api-url", help="Oz runs endpoint (default $FACTORY_FOREMAN_API_URL, then staging).")
+    p.add_argument("--environment", help="Cloud environment id (default $FACTORY_FOREMAN_ENV; else API default).")
+    p.add_argument("--out", help="CSV output path (default evals/results/<track>.csv; rows are appended).")
+    p.add_argument("--concurrency", type=int, default=4, help="Max in-flight runs (default 4).")
+    p.add_argument("--poll-interval", type=float, default=15.0, help="Seconds between status polls (default 15).")
+    p.add_argument("--timeout", type=float, default=2700.0, help="Per-run timeout in seconds (default 2700).")
+    p.add_argument("--cancel-on-timeout", dest="cancel_on_timeout", action="store_true", default=True,
+                   help="Cancel a run that exceeds --timeout (DEFAULT).")
+    p.add_argument("--no-cancel-on-timeout", dest="cancel_on_timeout", action="store_false",
+                   help="Leave timed-out runs running instead of cancelling them.")
+    p.add_argument("--eval-tag", help="Batch label for run names (default eval-<track>-<UTCts>); rows are grouped in the CSV by batch_timestamp.")
+    p.add_argument("--computer-use", dest="computer_use", action="store_true", default=True,
+                   help="Enable computer use for each run (DEFAULT).")
+    p.add_argument("--no-computer-use", dest="computer_use", action="store_false",
+                   help="Disable computer use for each run.")
+    p.add_argument("--apply-cleanup", action="store_true",
+                   help="Actually [Test]-prefix + close created PRs/tracker issues (default: preview only).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Resolve and print the requests as JSON without launching.")
+    return p
+
+
+def _build_schedule(args, track, config, tasks_file):
+    """Resolve the scheduled {task, model} run items and the scheduling mode.
+
+    * compare-models (--models): fan ONE request (--task-id / --prompt) across
+      the given models, one run per model x --reps (default 1).
+    * standard: round-robin the task list to exactly --runs entries, with one
+      model resolved up front (--model -> env override -> track config).
+    """
+    models = _parse_models(args.models)
+    if models:
+        if args.model:
+            _die("--model and --models are mutually exclusive")
+        if args.runs is not None:
+            _die("--runs applies to standard mode; use --reps for per-model repetitions")
+        reps = 1 if args.reps is None else args.reps
+        if reps < 1:
+            _die("--reps must be >= 1")
+        task = _select_single_task(tasks_file, args.task_id, args.prompt)
+        scheduled = [{"task": task, "model": m} for m in models for _ in range(reps)]
+        return scheduled, "compare-models", models
+    if args.reps is not None:
+        _die("--reps applies to compare-models mode; pass --models (or use --runs)")
+    if args.runs is None:
+        _die("--runs is required (or use --models m1,m2,... for compare-models mode)")
+    if args.runs < 1:
+        _die("--runs must be >= 1")
+    tasks = _load_tasks(tasks_file)
+    model = _resolve_model(track, args.model, config)
+    scheduled = [{"task": tasks[i % len(tasks)], "model": model} for i in range(args.runs)]
+    return scheduled, "standard", []
+
+
+def main():
+    args = _build_parser().parse_args()
+    if args.concurrency < 1:
+        _die("--concurrency must be >= 1")
+
+    track = args.track
+    config = _load_config(track)
+    skill = _derive_skill(track, config, args.skill)
+    environment_id = _resolve_environment(args.environment)
+    api_url = _resolve_api_url(args.api_url)
+    tasks_file = args.tasks_file or _default_tasks_file(track)
+    eval_tag = args.eval_tag or f"eval-{track}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    batch_timestamp = _iso_now()
+    out_path = args.out or _default_out(track)
+
+    scheduled, mode, models = _build_schedule(args, track, config, tasks_file)
+
+    if args.dry_run:
+        requests = []
+        for idx, item in enumerate(scheduled):
+            name = f"{eval_tag}#{idx + 1}"
+            requests.append({
+                "name": name,
+                "task_id": item["task"]["id"],
+                "model": item["model"],
+                "request": _build_request(
+                    skill, item["task"]["prompt"], item["model"], environment_id,
+                    name, args.computer_use,
+                ),
+            })
+        json.dump({
+            "mode": mode, "track": track, "eval_tag": eval_tag, "api_url": api_url,
+            "skill": skill, "environment_id": environment_id,
+            "tasks_file": tasks_file, "models": models, "runs": len(scheduled),
+            "out": out_path, "computer_use_enabled": args.computer_use,
+            "apply_cleanup": args.apply_cleanup,
+            "curl_auth_stdin": 'header = "Authorization: Bearer $WARP_API_KEY"',
+            "requests": requests,
+        }, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+
+    api_key = _resolve_api_key()
+    ctx = {
+        "track": track, "eval_tag": eval_tag, "batch_timestamp": batch_timestamp,
+        "skill": skill, "environment_id": environment_id,
+        "api_url": api_url, "api_key": api_key, "computer_use": args.computer_use,
+        "poll_interval": args.poll_interval, "timeout": args.timeout,
+        "cancel_on_timeout": args.cancel_on_timeout,
+    }
+
+    started_at = _iso_now()
+    _log(f"launching {len(scheduled)} run(s) [mode={mode}] for track={track} "
+         f"(concurrency={args.concurrency}, api={api_url})")
+    results = [None] * len(scheduled)
+    workers = min(args.concurrency, len(scheduled))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_process_run, ctx, idx, item): idx
+            for idx, item in enumerate(scheduled)
+        }
+        for fut, idx in futures.items():
+            results[idx] = fut.result()
+    records = [r for r in results if r is not None]
+
+    _cleanup(records, args.apply_cleanup)
+
+    _append_csv(out_path, records)
+    _log(f"appended {len(records)} row(s) -> {out_path}")
+
+    summary = _summary(records, {
+        "eval_tag": eval_tag, "track": track, "api_url": api_url, "mode": mode,
+        "model": args.model, "csv_path": out_path,
+        "started_at": started_at, "finished_at": _iso_now(),
+    })
+    json.dump(summary, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

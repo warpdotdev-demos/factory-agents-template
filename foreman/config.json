@@ -1,0 +1,31 @@
+{
+  "tracker": {
+    "provider": "jira",
+    "project_routing": {
+      "REPLACE_ME": "REPLACE_ME - plain-language description of the area this Jira project owns (components, services, product areas)"
+    },
+    "default_project": "REPLACE_ME",
+    "status_map": {
+      "Triage": "To Do",
+      "Todo": "To Do",
+      "In Progress": "In Progress",
+      "In Review": "In Review",
+      "Done": "Done",
+      "Canceled": "Done"
+    },
+    "story_points_field": "customfield_10016",
+    "issue_type": "Task"
+  },
+  "target_repos": {
+    "REPLACE_ME/REPLACE_ME": {
+      "description": "REPLACE_ME - plain-language description of what this repo owns (stack, components, product areas)",
+      "base_branch": "main",
+      "validate_command": "REPLACE_ME - the one command that validates a change (build + lint + tests)",
+      "test_guidance": "REPLACE_ME - one line on how regression tests are written and run in this repo (framework, directory, invocation)"
+    }
+  },
+  "default_target_repo": "REPLACE_ME/REPLACE_ME",
+  "spec_approval_required": true,
+  "self_repo": "REPLACE_ME/REPLACE_ME",
+  "self_project": "REPLACE_ME"
+}

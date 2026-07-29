@@ -1,0 +1,5 @@
+{
+  "_comment": "Identity map joining one person across Slack, Jira, and GitHub. 'overrides' maps a Jira accountId (or an email) to a GitHub reviewer handle (used by scripts/factory-resolve-reviewer). 'slack_users' maps a Slack user ID to the same person's display name, email, Jira accountId, and GitHub handle (used by the foreman to convert <@USERID> tokens into real Jira mentions). Find a Jira accountId with `scripts/tracker find-user \"<name-or-email>\"`. Seed one entry per teammate during onboarding - see SETUP.md step 7.",
+  "overrides": {},
+  "slack_users": {}
+}

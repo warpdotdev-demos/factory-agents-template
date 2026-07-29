@@ -1,0 +1,9 @@
+{
+  "agent": {
+    "entrypoint_skill": "factory-triage"
+  },
+  "model": "auto",
+  "repos": {
+    "self": "REPLACE_ME/REPLACE_ME"
+  }
+}

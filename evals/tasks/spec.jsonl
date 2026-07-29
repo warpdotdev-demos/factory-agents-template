@@ -1,0 +1,2 @@
+{"id": "spec-bulk-archive", "prompt": "Write a spec for a bulk-archive action: users can select multiple items in the list view and archive them in one operation, with undo."}
+{"id": "spec-rate-limit", "prompt": "Write a spec for per-user rate limiting on the public REST API, returning 429 with a Retry-After header when the limit is exceeded."}

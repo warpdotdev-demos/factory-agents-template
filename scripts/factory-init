@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""factory-init -- bootstrap the factory's config files for a new adopter.
+
+One deterministic entrypoint that writes the five config files a fresh copy of
+this template needs before its first run:
+
+  foreman/config.json          the shared, run-wide config (tracker block +
+                               target repos + self references)
+  triage/config.json           per-track dispatch config (repos.self updated;
+  spec/config.json             the track's entrypoint_skill and model are
+  implementation/config.json   preserved when the file already exists)
+  code-review/config.json
+
+It also seeds scripts/reviewer_overrides.json with an empty skeleton when the
+file does not exist yet (an existing file is never touched).
+
+Two ways to supply values:
+  * FLAGS (non-interactive; suitable for automation) -- see --help.
+  * INTERACTIVE prompts -- run with --interactive (or with no value flags on a
+    TTY) and every value is prompted for with a sensible default.
+
+Jira autodiscovery (optional, on by default): when $JIRA_BASE_URL,
+$JIRA_EMAIL, and $JIRA_API_TOKEN are exported, the script calls the Jira Cloud
+REST API to
+  * list the REAL workflow status names for each routed project
+    (GET /rest/api/3/project/<KEY>/statuses) and validate every status_map
+    value against them (warning on mismatches -- Jira status setting is
+    transition-based and silently fails later if the name is wrong), and
+  * auto-detect the story-points custom field id
+    (GET /rest/api/3/field, matching "story point" in the field name).
+Discovery soft-fails: any network/auth error degrades to a stderr warning and
+manual values. Pass --no-discover to skip it entirely.
+
+Safety: an existing foreman/config.json that still contains REPLACE_ME
+placeholders (pristine template state) is overwritten freely; one that was
+already customized requires --force. reviewer_overrides.json is never
+overwritten. --dry-run prints the resolved configs without writing anything.
+
+Emits a JSON summary (written/skipped files + warnings) to stdout; fails loud
+(nonzero exit + stderr) on invalid input.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+TRACKS = ("triage", "spec", "implementation", "code-review")
+# Default entry skill per track, used only when a track config is missing.
+DEFAULT_ENTRYPOINT_SKILLS = {
+    "triage": "factory-triage",
+    "spec": "factory-spec",
+    "implementation": "factory-implement",
+    "code-review": "factory-review",
+}
+DEFAULT_MODEL = "auto"
+PLACEHOLDER = "REPLACE_ME"
+
+FACTORY_STATES = ("Triage", "Todo", "In Progress", "In Review", "Done", "Canceled")
+# A common out-of-the-box Jira Software workflow; adopters remap per project.
+DEFAULT_STATUS_MAP = {
+    "Triage": "To Do",
+    "Todo": "To Do",
+    "In Progress": "In Progress",
+    "In Review": "In Review",
+    "Done": "Done",
+    "Canceled": "Done",
+}
+# The most common story-points field id on Jira Cloud sites; used only when
+# discovery is unavailable and no explicit value was given.
+COMMON_STORY_POINTS_FIELD = "customfield_10016"
+
+TARGET_REPO_REQUIRED_FIELDS = (
+    "description",
+    "base_branch",
+    "validate_command",
+    "test_guidance",
+)
+TARGET_REPO_OPTIONAL_FIELDS = ("app_start_command", "app_url")
+
+REVIEWER_OVERRIDES_SKELETON = {
+    "_comment": (
+        "Identity map joining one person across Slack, Jira, and GitHub. "
+        "'overrides' maps a Jira accountId (or an email) to a GitHub reviewer "
+        "handle (used by scripts/factory-resolve-reviewer). 'slack_users' maps "
+        "a Slack user ID to the same person's display name, email, Jira "
+        "accountId, and GitHub handle (used by the foreman to convert <@USERID> "
+        "tokens into real Jira mentions). Find a Jira accountId with "
+        "`scripts/tracker find-user \"<name-or-email>\"`. See SETUP.md."
+    ),
+    "overrides": {},
+    "slack_users": {},
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write("factory-init: " + msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def warn(msg, warnings=None):
+    sys.stderr.write("factory-init: warning: " + msg.rstrip() + "\n")
+    if warnings is not None:
+        warnings.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# Jira autodiscovery (optional; soft-fails to manual values)
+# ---------------------------------------------------------------------------
+
+def _jira_env():
+    """The (base_url, email, token) triple, or None when any part is unset."""
+    base = os.environ.get("JIRA_BASE_URL", "").strip().rstrip("/")
+    email = os.environ.get("JIRA_EMAIL", "").strip()
+    token = os.environ.get("JIRA_API_TOKEN", "")
+    if not (base and email and token):
+        return None
+    return base, email, token
+
+
+def _jira_get(env, path):
+    """GET a Jira Cloud REST v3 path; returns parsed JSON or raises."""
+    base, email, token = env
+    url = base + "/rest/api/3/" + path.lstrip("/")
+    auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": "Basic " + auth, "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def discover_statuses(env, project_key, warnings):
+    """The set of real status names for a project, or None when unavailable."""
+    try:
+        data = _jira_get(env, f"project/{urllib.parse.quote(project_key)}/statuses")
+    except Exception as e:  # noqa: BLE001 - soft-fail by design
+        warn(f"could not list statuses for project {project_key!r}: {e}", warnings)
+        return None
+    names = set()
+    if isinstance(data, list):
+        for issue_type in data:
+            for status in issue_type.get("statuses", []) or []:
+                name = status.get("name")
+                if name:
+                    names.add(name)
+    return names or None
+
+
+def discover_story_points_field(env, warnings):
+    """The story-points custom field id, or None when unavailable/ambiguous."""
+    try:
+        fields = _jira_get(env, "field")
+    except Exception as e:  # noqa: BLE001 - soft-fail by design
+        warn(f"could not list Jira fields: {e}", warnings)
+        return None
+    matches = [
+        f for f in fields
+        if isinstance(f, dict) and "story point" in (f.get("name") or "").lower()
+    ]
+    if not matches:
+        warn("no Jira field with 'story point' in its name was found", warnings)
+        return None
+    # Prefer the classic "Story Points" / "Story point estimate" names.
+    matches.sort(key=lambda f: len(f.get("name") or ""))
+    chosen = matches[0]
+    if len(matches) > 1:
+        others = ", ".join(f"{f['id']} ({f['name']})" for f in matches[1:])
+        warn(
+            f"multiple story-point fields found; using {chosen['id']} "
+            f"({chosen['name']}); alternatives: {others}",
+            warnings,
+        )
+    return chosen.get("id")
+
+
+# ---------------------------------------------------------------------------
+# Value parsing
+# ---------------------------------------------------------------------------
+
+def parse_pairs(raw, what):
+    """Parse 'A=B' comma/repeat-separated pairs into an ordered dict."""
+    result = {}
+    for item in raw:
+        for pair in item.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                die(f"invalid {what} entry {pair!r}; expected KEY=VALUE")
+            key, _, value = pair.partition("=")
+            key, value = key.strip(), value.strip()
+            if not key or not value:
+                die(f"invalid {what} entry {pair!r}; expected KEY=VALUE")
+            result[key] = value
+    return result
+
+
+def load_target_repos_json(raw):
+    """Parse --target-repos-json (inline JSON or @path-to-file)."""
+    text = raw
+    if raw.startswith("@"):
+        path = raw[1:]
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as e:
+            die(f"could not read --target-repos-json file {path}: {e}")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        die(f"--target-repos-json is not valid JSON: {e}")
+    if not isinstance(data, dict) or not data:
+        die("--target-repos-json must be a non-empty JSON object keyed by org/repo")
+    return data
+
+
+def validate_target_repos(target_repos):
+    for repo, entry in target_repos.items():
+        if "/" not in repo:
+            die(f"target repo key {repo!r} must be org/repo")
+        if not isinstance(entry, dict):
+            die(f"target repo {repo!r} entry must be a JSON object")
+        missing = [f for f in TARGET_REPO_REQUIRED_FIELDS if not entry.get(f)]
+        if missing:
+            die(f"target repo {repo!r} is missing required field(s): "
+                + ", ".join(missing))
+        unknown = [
+            f for f in entry
+            if f not in TARGET_REPO_REQUIRED_FIELDS + TARGET_REPO_OPTIONAL_FIELDS
+        ]
+        if unknown:
+            die(f"target repo {repo!r} has unknown field(s): " + ", ".join(unknown))
+
+
+# ---------------------------------------------------------------------------
+# Interactive prompts
+# ---------------------------------------------------------------------------
+
+def prompt(question, default=None, required=True):
+    suffix = f" [{default}]" if default not in (None, "") else ""
+    while True:
+        sys.stderr.write(f"{question}{suffix}: ")
+        sys.stderr.flush()
+        answer = input().strip()
+        if not answer and default is not None:
+            return default
+        if answer or not required:
+            return answer
+
+
+def prompt_bool(question, default):
+    raw = prompt(question + " (y/n)", "y" if default else "n")
+    return raw.strip().lower() in ("y", "yes", "true", "1")
+
+
+def interactive_values(args, jira_env, warnings):
+    """Prompt for every value not already provided by a flag."""
+    print("factory-init: interactive setup (Ctrl+C to abort; defaults in [])",
+          file=sys.stderr)
+    self_repo = args.self_repo or prompt(
+        "org/repo of YOUR copy of this template (self repo)")
+
+    projects = parse_pairs(args.project, "--project") if args.project else {}
+    while not projects:
+        key = prompt("Jira project key the factory files tickets in (e.g. ENG)")
+        desc = prompt(f"one-line description of what project {key} owns")
+        projects[key] = desc
+        while prompt_bool("add another routed project?", False):
+            key = prompt("Jira project key")
+            desc = prompt(f"one-line description of what project {key} owns")
+            projects[key] = desc
+
+    default_project = args.default_project or prompt(
+        "fallback project key when routing finds no match",
+        next(iter(projects)))
+    self_project = args.self_project or prompt(
+        "project key for the factory's own self-improvement tickets",
+        default_project)
+    browse_url = args.browse_url or prompt(
+        "human Jira site URL (e.g. https://yourcompany.atlassian.net; empty to omit)",
+        os.environ.get("JIRA_BASE_URL", ""), required=False)
+    issue_type = args.issue_type or prompt(
+        "Jira issue type for factory tickets", "Task")
+
+    status_map = parse_pairs(args.status_map, "--status-map") if args.status_map else {}
+    if not status_map:
+        known = None
+        if jira_env:
+            known = discover_statuses(jira_env, default_project, warnings)
+            if known:
+                print("factory-init: statuses in project "
+                      f"{default_project}: {', '.join(sorted(known))}",
+                      file=sys.stderr)
+        for state in FACTORY_STATES:
+            status_map[state] = prompt(
+                f"Jira status name for factory state {state!r}",
+                DEFAULT_STATUS_MAP[state])
+
+    story_points = args.story_points_field
+    if story_points is None:
+        discovered = discover_story_points_field(jira_env, warnings) if jira_env else None
+        story_points = prompt(
+            "story-points custom field id ('none' to disable estimates)",
+            discovered or COMMON_STORY_POINTS_FIELD)
+
+    target_repos = (
+        load_target_repos_json(args.target_repos_json)
+        if args.target_repos_json else {}
+    )
+    while not target_repos:
+        repo = prompt("target org/repo the factory ships changes to")
+        entry = {
+            "description": prompt(f"one-line description of what {repo} owns"),
+            "base_branch": prompt("base branch PRs open against", "main"),
+            "validate_command": prompt(
+                "the one command that validates a change (build+lint+tests)"),
+            "test_guidance": prompt(
+                "one line on how regression tests are written and run there"),
+        }
+        app_start = prompt(
+            "command that boots the app for UI verification (empty if headless)",
+            "", required=False)
+        if app_start:
+            entry["app_start_command"] = app_start
+            entry["app_url"] = prompt(
+                "local URL the running app serves", "http://localhost:8000")
+        target_repos[repo] = entry
+        while prompt_bool("add another target repo?", False):
+            repo = prompt("target org/repo")
+            entry = {
+                "description": prompt(f"one-line description of what {repo} owns"),
+                "base_branch": prompt("base branch PRs open against", "main"),
+                "validate_command": prompt("the one validation command"),
+                "test_guidance": prompt("one line of regression-test guidance"),
+            }
+            app_start = prompt(
+                "command that boots the app for UI verification (empty if headless)",
+                "", required=False)
+            if app_start:
+                entry["app_start_command"] = app_start
+                entry["app_url"] = prompt(
+                    "local URL the running app serves", "http://localhost:8000")
+            target_repos[repo] = entry
+
+    default_target_repo = args.default_target_repo or prompt(
+        "fallback target repo when routing finds no match",
+        next(iter(target_repos)))
+    spec_approval = (
+        args.spec_approval_required
+        if args.spec_approval_required is not None
+        else prompt_bool("pause for human spec approval before implementation?", True)
+    )
+
+    return {
+        "self_repo": self_repo,
+        "browse_url": browse_url or None,
+        "projects": projects,
+        "default_project": default_project,
+        "self_project": self_project,
+        "issue_type": issue_type,
+        "status_map": status_map,
+        "story_points_field": story_points,
+        "target_repos": target_repos,
+        "default_target_repo": default_target_repo,
+        "spec_approval_required": spec_approval,
+    }
+
+
+def flag_values(args, jira_env, warnings):
+    """Resolve every value from flags (non-interactive); fail loud on gaps."""
+    missing = []
+    if not args.self_repo:
+        missing.append("--self-repo")
+    if not args.project:
+        missing.append("--project")
+    if not (args.target_repos_json or args.target_repo):
+        missing.append("--target-repos-json or --target-repo")
+    if missing:
+        die("missing required flag(s): " + ", ".join(missing)
+            + " (or run with --interactive)")
+
+    projects = parse_pairs(args.project, "--project")
+    default_project = args.default_project or next(iter(projects))
+    if default_project not in projects:
+        die(f"--default-project {default_project!r} is not a --project key")
+
+    status_map = dict(DEFAULT_STATUS_MAP)
+    status_map.update(parse_pairs(args.status_map, "--status-map"))
+    unknown_states = [s for s in status_map if s not in FACTORY_STATES]
+    if unknown_states:
+        die("unknown factory state(s) in --status-map: "
+            + ", ".join(unknown_states)
+            + f"; the factory states are: {', '.join(FACTORY_STATES)}")
+
+    story_points = args.story_points_field
+    if story_points is None:
+        discovered = discover_story_points_field(jira_env, warnings) if jira_env else None
+        if discovered:
+            story_points = discovered
+        else:
+            story_points = COMMON_STORY_POINTS_FIELD
+            warn(
+                "story-points field not discovered; defaulting to "
+                f"{COMMON_STORY_POINTS_FIELD} - verify it per SETUP.md or pass "
+                "--story-points-field (use 'none' to disable estimates)",
+                warnings,
+            )
+
+    if args.target_repos_json:
+        target_repos = load_target_repos_json(args.target_repos_json)
+    else:
+        entry = {
+            "description": args.target_description,
+            "base_branch": args.target_base_branch,
+            "validate_command": args.target_validate_command,
+            "test_guidance": args.target_test_guidance,
+        }
+        gaps = [k for k, v in entry.items() if not v]
+        if gaps:
+            die("--target-repo also requires --target-description, "
+                "--target-base-branch, --target-validate-command, and "
+                "--target-test-guidance (missing: "
+                + ", ".join("--target-" + g.replace("_", "-") for g in gaps) + ")")
+        if args.target_app_start_command:
+            entry["app_start_command"] = args.target_app_start_command
+        if args.target_app_url:
+            entry["app_url"] = args.target_app_url
+        target_repos = {args.target_repo: entry}
+
+    default_target_repo = args.default_target_repo or next(iter(target_repos))
+    if default_target_repo not in target_repos:
+        die(f"--default-target-repo {default_target_repo!r} is not a configured "
+            "target repo")
+
+    return {
+        "self_repo": args.self_repo,
+        "browse_url": args.browse_url or None,
+        "projects": projects,
+        "default_project": default_project,
+        "self_project": args.self_project or default_project,
+        "issue_type": args.issue_type or "Task",
+        "status_map": status_map,
+        "story_points_field": story_points,
+        "target_repos": target_repos,
+        "default_target_repo": default_target_repo,
+        "spec_approval_required": (
+            args.spec_approval_required
+            if args.spec_approval_required is not None else True
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Config composition + writing
+# ---------------------------------------------------------------------------
+
+def build_foreman_config(values):
+    tracker = {
+        "provider": "jira",
+        "project_routing": values["projects"],
+        "default_project": values["default_project"],
+        "status_map": {s: values["status_map"][s] for s in FACTORY_STATES},
+        "story_points_field": (
+            None
+            if str(values["story_points_field"]).lower() in ("none", "null", "")
+            else values["story_points_field"]
+        ),
+        "issue_type": values["issue_type"],
+    }
+    if values.get("browse_url"):
+        tracker["browse_url"] = values["browse_url"].rstrip("/")
+    return {
+        "tracker": tracker,
+        "target_repos": values["target_repos"],
+        "default_target_repo": values["default_target_repo"],
+        "spec_approval_required": values["spec_approval_required"],
+        "self_repo": values["self_repo"],
+        "self_project": values["self_project"],
+    }
+
+
+def build_track_config(repo_root, track, self_repo):
+    """The track config with repos.self updated and everything else preserved."""
+    path = os.path.join(repo_root, track, "config.json")
+    config = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                config = json.load(fh)
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"could not read existing {path}: {e}")
+        if not isinstance(config, dict):
+            config = {}
+    agent = config.get("agent") if isinstance(config.get("agent"), dict) else {}
+    if not agent.get("entrypoint_skill") or agent.get("entrypoint_skill") == PLACEHOLDER:
+        agent["entrypoint_skill"] = DEFAULT_ENTRYPOINT_SKILLS[track]
+    config["agent"] = agent
+    if not config.get("model") or config.get("model") == PLACEHOLDER:
+        config["model"] = DEFAULT_MODEL
+    config["repos"] = {"self": self_repo}
+    return config
+
+
+def is_pristine(path):
+    """True when the file is absent or still contains REPLACE_ME placeholders."""
+    if not os.path.isfile(path):
+        return True
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return PLACEHOLDER in fh.read()
+    except OSError:
+        return True
+
+
+def write_json(path, data, dry_run, written):
+    if dry_run:
+        written.append({"path": path, "dry_run": True, "content": data})
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    written.append({"path": path, "dry_run": False})
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="factory-init",
+        description=(
+            "Bootstrap the factory's config files (foreman/config.json, the "
+            "four track configs, and a reviewer_overrides.json skeleton) from "
+            "flags or interactive prompts, with optional Jira autodiscovery "
+            "of workflow statuses and the story-points field."
+        ),
+    )
+    parser.add_argument("--self-repo",
+                        help="org/repo of YOUR copy of this template")
+    parser.add_argument("--self-project",
+                        help="Jira project key for the factory's own "
+                             "self-improvement tickets (default: the default "
+                             "project)")
+    parser.add_argument("--browse-url",
+                        help="human Jira site URL for clickable issue links "
+                             "(needed when $JIRA_BASE_URL is the "
+                             "api.atlassian.com gateway)")
+    parser.add_argument("--project", action="append", default=[],
+                        metavar="KEY=DESCRIPTION",
+                        help="a routed Jira project and what it owns "
+                             "(repeatable / comma-separated)")
+    parser.add_argument("--default-project",
+                        help="fallback project key (default: first --project)")
+    parser.add_argument("--issue-type", help="Jira issue type (default: Task)")
+    parser.add_argument("--status-map", action="append", default=[],
+                        metavar="STATE=JIRA_STATUS",
+                        help="map a factory state (Triage, Todo, In Progress, "
+                             "In Review, Done, Canceled) to your real Jira "
+                             "status name (repeatable / comma-separated; "
+                             "unmapped states use a common default)")
+    parser.add_argument("--story-points-field",
+                        help="Jira custom field id for story points, or "
+                             "'none' to disable estimates (default: "
+                             "autodiscover, else customfield_10016)")
+    parser.add_argument("--target-repos-json", metavar="JSON|@FILE",
+                        help="full target_repos map as inline JSON or @file "
+                             "(keys org/repo; fields description, base_branch, "
+                             "validate_command, test_guidance, and optional "
+                             "app_start_command, app_url)")
+    parser.add_argument("--target-repo",
+                        help="single target org/repo (alternative to "
+                             "--target-repos-json)")
+    parser.add_argument("--target-description",
+                        help="what the single target repo owns")
+    parser.add_argument("--target-base-branch",
+                        help="base branch of the single target repo")
+    parser.add_argument("--target-validate-command",
+                        help="validation command of the single target repo")
+    parser.add_argument("--target-test-guidance",
+                        help="regression-test guidance for the single target repo")
+    parser.add_argument("--target-app-start-command",
+                        help="optional app-boot command for UI verification")
+    parser.add_argument("--target-app-url",
+                        help="optional local URL of the running app")
+    parser.add_argument("--default-target-repo",
+                        help="fallback target repo (default: first configured)")
+    spec = parser.add_mutually_exclusive_group()
+    spec.add_argument("--spec-approval-required", dest="spec_approval_required",
+                      action="store_true", default=None,
+                      help="pause for human spec approval (the default)")
+    spec.add_argument("--no-spec-approval-required", dest="spec_approval_required",
+                      action="store_false",
+                      help="let committed specs auto-advance with no pause")
+    parser.add_argument("--interactive", action="store_true",
+                        help="prompt for every value (default when run on a "
+                             "TTY with no value flags)")
+    parser.add_argument("--no-discover", action="store_true",
+                        help="skip Jira autodiscovery even when $JIRA_* is set")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite an already-customized foreman/config.json")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the resolved configs without writing")
+    parser.add_argument("--repo-root", default=DEFAULT_REPO_ROOT,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    warnings = []
+    jira_env = None if args.no_discover else _jira_env()
+    if jira_env is None and not args.no_discover:
+        warn("$JIRA_BASE_URL / $JIRA_EMAIL / $JIRA_API_TOKEN not all set; "
+             "skipping Jira autodiscovery (values are used as given)", warnings)
+
+    has_value_flags = bool(args.self_repo or args.project or args.target_repo
+                           or args.target_repos_json)
+    interactive = args.interactive or (not has_value_flags and sys.stdin.isatty())
+    if interactive:
+        try:
+            values = interactive_values(args, jira_env, warnings)
+        except (KeyboardInterrupt, EOFError):
+            die("aborted")
+    else:
+        values = flag_values(args, jira_env, warnings)
+
+    if "/" not in values["self_repo"]:
+        die(f"self repo {values['self_repo']!r} must be org/repo")
+    validate_target_repos(values["target_repos"])
+    missing_states = [s for s in FACTORY_STATES if not values["status_map"].get(s)]
+    if missing_states:
+        die("status_map is missing factory state(s): " + ", ".join(missing_states))
+
+    # Validate the status map against the real workflow when discoverable.
+    if jira_env:
+        known = discover_statuses(jira_env, values["default_project"], warnings)
+        if known:
+            lowered = {k.lower() for k in known}
+            for state, status in values["status_map"].items():
+                if status.lower() not in lowered:
+                    warn(
+                        f"status_map[{state!r}] = {status!r} is not a status in "
+                        f"project {values['default_project']} (statuses: "
+                        + ", ".join(sorted(known)) + ")",
+                        warnings,
+                    )
+
+    foreman_path = os.path.join(args.repo_root, "foreman", "config.json")
+    if not is_pristine(foreman_path) and not args.force and not args.dry_run:
+        die(f"{foreman_path} is already customized (no {PLACEHOLDER} "
+            "placeholders); pass --force to overwrite it")
+
+    written, skipped = [], []
+    write_json(foreman_path, build_foreman_config(values), args.dry_run, written)
+    for track in TRACKS:
+        path = os.path.join(args.repo_root, track, "config.json")
+        write_json(path, build_track_config(args.repo_root, track,
+                                            values["self_repo"]),
+                   args.dry_run, written)
+
+    overrides_path = os.path.join(args.repo_root, "scripts",
+                                  "reviewer_overrides.json")
+    if os.path.isfile(overrides_path):
+        skipped.append({"path": overrides_path,
+                        "reason": "exists; never overwritten"})
+    else:
+        write_json(overrides_path, REVIEWER_OVERRIDES_SKELETON,
+                   args.dry_run, written)
+
+    print(json.dumps({
+        "written": written,
+        "skipped": skipped,
+        "warnings": warnings,
+        "next_steps": [
+            "seed scripts/reviewer_overrides.json with your team's identities "
+            "(SETUP.md step 7)",
+            "run scripts/check to validate the repo",
+            "commit the config changes to your copy of the template",
+        ],
+    }, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

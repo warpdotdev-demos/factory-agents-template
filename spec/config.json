@@ -1,0 +1,9 @@
+{
+  "agent": {
+    "entrypoint_skill": "factory-spec"
+  },
+  "model": "auto",
+  "repos": {
+    "self": "REPLACE_ME/REPLACE_ME"
+  }
+}

@@ -1,0 +1,3 @@
+# Python bytecode from running the factory scripts (e.g. scripts/check -> py_compile)
+__pycache__/
+*.pyc

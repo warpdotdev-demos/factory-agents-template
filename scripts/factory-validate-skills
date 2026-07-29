@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Validate the factory-agents repo's SKILL.md files for internal consistency.
+
+Emits a human-readable pass/fail report and exits nonzero on any failure. This
+is the deterministic, reproducible half of factory-self-update Step 4; the
+routing-trace remains a human/agent judgment step and is intentionally NOT
+scripted here.
+
+Checks performed:
+  1. Frontmatter lint - every */SKILL.md starts with a `---` line and declares a
+     non-empty kebab-case `name` plus a non-empty `description`.
+  2. `git --no-pager diff --check` - no whitespace errors or leftover conflict
+     markers in the working tree.
+  3. Cross-reference scan - flag references to skill names that do not resolve to
+     an existing skill (dangling references left behind by a rename/removal).
+  4. Colon-in-prose scan - SKILL.md prose outside code fences and inline code
+     must not contain colons (frontmatter is exempt; it is validated as YAML by
+     check 1). Existing violations are tracked in an allowlist so the rule is
+     enforced only for cleaned-up skills and newly authored/edited skills.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+# kebab-case token with at least two segments (e.g. factory-triage), the shape
+# every skill directory in this repo uses.
+KEBAB = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+")
+INLINE_CODE = re.compile(r"`([^`\n]+)`")
+SKILL_PATH = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_-]*)/SKILL\.md")
+
+# Names that share a skill family prefix but are NOT skills in this repo, so the
+# cross-reference scan must not flag them.
+REFERENCE_ALLOWLIST = {
+    "factory-agent",  # the PR<->task metadata block / agent identity
+    "factory-agents",  # this repository
+    "factory-skills",  # the upstream single-agent playbook repo (attribution)
+    # Pipeline gate labels (tracker labels, not skills) — backtick-quoted across
+    # skills, AGENTS.md, and README but never skill names. Allowed so the
+    # cross-reference scan does not flag them as dangling skill references.
+    "triage-done",
+    "spec-done",
+    "impl-done",
+    "review-done",
+}
+
+# Frozen scripts/ CLI surface. Skills legitimately reference these by name; treat
+# them as valid even when a given worktree hasn't materialized every script yet
+# (the scan's job is to catch dangling *skill* references, not absent siblings).
+KNOWN_SCRIPTS = {
+    "factory-pr-meta",
+    "factory-resolve-reviewer",
+    "factory-state",
+    "factory-validate-skills",
+    "check",
+    "forge",
+    "github",
+    "mock-code-forge",
+}
+
+
+def repo_root():
+    out = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        sys.stderr.write("error: not inside a git repository\n")
+        sys.stderr.write(out.stderr)
+        sys.exit(2)
+    return out.stdout.strip()
+
+
+def find_skill_files(root):
+    """Discover every */SKILL.md anywhere under root (skipping .git and scripts).
+
+    The factory-agents repo nests skills per agent
+    (agents/<agent>/skills/<skill>/SKILL.md) and shares cross-cutting ones
+    (shared-skills/<skill>/SKILL.md), so discovery walks the tree rather than
+    only scanning the repo root. The skill name is the basename of the
+    directory containing SKILL.md.
+    """
+    skills = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "scripts")]
+        if "SKILL.md" in filenames:
+            name = os.path.basename(dirpath)
+            skills.append((name, os.path.join(dirpath, "SKILL.md")))
+    skills.sort(key=lambda pair: pair[1])
+    return skills
+
+
+def parse_frontmatter(path):
+    """Return (first_line_ok, fields) for the leading `---` fenced block."""
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    if not lines or lines[0].strip() != "---":
+        return False, {}
+    fields = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        m = re.match(r"([A-Za-z0-9_-]+):\s*(.*)$", line)
+        if m:
+            fields[m.group(1)] = m.group(2).strip()
+    return True, fields
+
+
+def script_names(root):
+    """Basenames of executables under scripts/ (referenceable, not skills)."""
+    names = set()
+    scripts_dir = os.path.join(root, "scripts")
+    if os.path.isdir(scripts_dir):
+        for entry in os.listdir(scripts_dir):
+            full = os.path.join(scripts_dir, entry)
+            if os.path.isfile(full) and os.access(full, os.X_OK):
+                names.add(entry)
+    return names
+
+
+def check_frontmatter(skills):
+    failures = []
+    for name, path in skills:
+        first_ok, fields = parse_frontmatter(path)
+        if not first_ok:
+            failures.append(f"{path}: first line is not `---` frontmatter fence")
+            continue
+        fm_name = fields.get("name", "")
+        if not fm_name:
+            failures.append(f"{path}: missing or empty `name`")
+        elif not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", fm_name):
+            failures.append(f"{path}: `name` is not kebab-case: {fm_name!r}")
+        if not fields.get("description", ""):
+            failures.append(f"{path}: missing or empty `description`")
+    return failures
+
+
+def check_diff(root):
+    out = subprocess.run(
+        ["git", "--no-pager", "diff", "--check"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        detail = (out.stdout + out.stderr).strip()
+        return [f"git diff --check reported issues:\n{detail}"]
+    return []
+
+
+def check_colons(skills):
+    """Scan SKILL.md prose for colons outside code fences and inline code.
+
+    Self-update skill prose must be colon-free. Code fences and inline code are
+    exempt because colons can be required syntax there. Frontmatter (including
+    the `description` value) is also exempt because it is validated as YAML by
+    the frontmatter-lint check, which already rejects colons that break parsing.
+
+    Existing skills with prose colons are tracked in COLON_ALLOWLIST so the check
+    only enforces the rule for cleaned-up skills and for newly edited/created
+    skills. For a non-allowlisted skill every offending line is reported, so a
+    cleanup can be verified in a single pass.
+    """
+    # Existing skills that still contain colons in prose outside code fences.
+    # Remove an entry when that skill is cleaned up. New skills must not introduce
+    # colons.
+    COLON_ALLOWLIST = {
+        "check-impl-against-spec",
+        "complete",
+        "evaluate-complexity",
+        "factory-foreman",
+        "factory-github-ops",
+        "factory-implement",
+        "factory-progress-updates",
+        "factory-review",
+        "factory-spec",
+        "factory-triage",
+        "factory-verification",
+        "fix-failing-ci",
+        "manage-review-reassignment",
+        "review-pr",
+    }
+
+    FENCE = re.compile(r"^\s*```")
+    failures = []
+    for name, path in skills:
+        first_ok, _ = parse_frontmatter(path)
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+
+        # Skip YAML frontmatter (delimited by --- at the top of the file).
+        frontmatter_end = 0
+        if first_ok and lines and lines[0].strip() == "---":
+            for i, line in enumerate(lines[1:], start=2):
+                if line.strip() == "---":
+                    frontmatter_end = i
+                    break
+
+        in_code_fence = False
+        for lineno, raw in enumerate(lines, start=1):
+            if lineno <= frontmatter_end:
+                continue
+            stripped = raw.strip()
+            if FENCE.match(stripped):
+                in_code_fence = not in_code_fence
+                continue
+            if in_code_fence:
+                continue
+            # Strip inline code spans before checking prose.
+            prose = re.sub(r"`[^`\n]+`", "", raw)
+            if ":" in prose:
+                if name in COLON_ALLOWLIST:
+                    # Allowlisted skills are exempt; one hit is enough to confirm
+                    # the entry is still warranted, so stop scanning this file.
+                    break
+                failures.append(
+                    f"{path}:{lineno}: colon in prose outside code fences"
+                )
+    return failures
+
+
+def check_cross_references(root, skills):
+    valid_skills = {name for name, _ in skills}
+    valid = (
+        valid_skills | script_names(root) | KNOWN_SCRIPTS | REFERENCE_ALLOWLIST
+    )
+    # Skill family prefixes (first hyphen segment) limit which tokens we treat as
+    # candidate skill references, keeping the scan high-signal.
+    families = {name.split("-", 1)[0] for name in valid_skills}
+
+    # Cross-reference targets: the top README, every agent's AGENTS.md playbook,
+    # and every SKILL.md.
+    targets = [os.path.join(root, "README.md")]
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "scripts")]
+        if "AGENTS.md" in filenames:
+            targets.append(os.path.join(dirpath, "AGENTS.md"))
+    targets += [path for _, path in skills]
+    failures = []
+    for path in targets:
+        if not os.path.isfile(path):
+            continue
+        rel = os.path.relpath(path, root)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        flagged = {}
+        # Inline-code references such as `factory-github-ops`.
+        for span in INLINE_CODE.findall(text):
+            for token in KEBAB.findall(span):
+                if token in valid:
+                    continue
+                if token.split("-", 1)[0] in families:
+                    flagged.setdefault(token, "inline reference")
+        # Path references such as factory-skills/<name>/SKILL.md (strong signal:
+        # the /SKILL.md suffix means a skill is intended). Require a hyphen so
+        # placeholders like <name> are ignored.
+        for token in SKILL_PATH.findall(text):
+            if "-" not in token or token in valid:
+                continue
+            flagged[token] = "skill path reference"
+        for token, kind in sorted(flagged.items()):
+            failures.append(
+                f"{rel}: dangling {kind} to unknown skill {token!r}"
+            )
+    return failures
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="factory-validate-skills",
+        description=(
+            "Lint SKILL.md frontmatter, run git diff --check, scan for dangling "
+            "skill cross-references, and check for colons in prose. Exits "
+            "nonzero on any failure."
+        ),
+    )
+    parser.parse_args()
+
+    root = repo_root()
+    skills = find_skill_files(root)
+
+    sections = [
+        ("frontmatter lint", check_frontmatter(skills)),
+        ("git diff --check", check_diff(root)),
+        ("cross-reference scan", check_cross_references(root, skills)),
+        ("colon-in-prose scan", check_colons(skills)),
+    ]
+
+    all_failures = []
+    for title, failures in sections:
+        if failures:
+            print(f"FAIL  {title}")
+            for f in failures:
+                print(f"  - {f}")
+            all_failures.extend(failures)
+        else:
+            print(f"ok    {title}")
+
+    if all_failures:
+        print(f"\nfactory-validate-skills: {len(all_failures)} problem(s) found")
+        return 1
+    print(f"\nfactory-validate-skills: {len(skills)} skill(s) OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

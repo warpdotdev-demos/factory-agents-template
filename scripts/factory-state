@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""factory-state — one JSON snapshot of a task's externally-mutable PR facts.
+
+This is a pure COMPOSER over factory-pr-meta. It does NOT reimplement gh logic,
+and it contains NO routing/judgment/phase decisions — deciding where a task is
+in the loop is factory-triage's job. It is task-system agnostic: it reports only
+the GitHub PR facts that can change outside the current run, keyed by a stable
+task id.
+
+Reported facts:
+  * the linked PR's state / merge status / reviewers (or null when none exists).
+
+Task-tracker state (e.g. a tracker issue's status, comments, assignee) is NOT
+read here — agents read/update that through the task tracker directly (see the
+factory-tracker-ops skill, which uses the `scripts/tracker` CLI). This script stays
+a thin, deterministic PR-state probe.
+
+Composed contracts (resolved from the sibling scripts in this same dir):
+  * `factory-pr-meta find --task-id ID --repo R`   -> linked PR JSON (or empty)
+  * `factory-pr-meta merged --repo R --pr N`       -> {state, mergedAt, merged}
+
+The task's PR may live in any configured factory repo (one of the target repos,
+or this repo for self-skills changes — all read from foreman/config.json), so
+when --repo is omitted we probe every configured repo in order (a task maps to
+at most one PR per repo).
+
+Fails loudly (nonzero exit + stderr) if any composed call fails, surfacing the
+underlying script's error output.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Repos a factory task can map to: a target-repo fix (a key of the config
+# `target_repos` map, or the legacy single `target_repo` string) or a
+# self-skills update (config `self_repo`). Read from foreman/config.json and
+# probed in order when no --repo hint is given; unset / REPLACE_ME placeholders
+# are skipped.
+_FOREMAN_CONFIG = os.path.join(
+    os.path.dirname(SCRIPT_DIR), "foreman", "config.json"
+)
+
+
+def _configured_repos():
+    try:
+        with open(_FOREMAN_CONFIG, encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    repos = []
+
+    def _add(value):
+        if isinstance(value, str) and "/" in value and "REPLACE_ME" not in value:
+            if value not in repos:
+                repos.append(value)
+
+    target_repos = config.get("target_repos")
+    if isinstance(target_repos, dict):
+        for key in target_repos:
+            _add(key)
+    _add(config.get("target_repo"))  # legacy single-repo key
+    _add(config.get("self_repo"))
+    return tuple(repos)
+
+
+FACTORY_REPOS = _configured_repos()
+
+
+def _die(msg):
+    print(f"factory-state: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _run_json(argv, what, allow_empty=False):
+    """Run a sibling script (by basename) and parse its stdout as JSON.
+
+    Fails loudly on nonzero exit, surfacing the child's stderr. When
+    allow_empty is set, empty stdout is a valid "no result" signal and
+    returns None rather than erroring.
+    """
+    path = os.path.join(SCRIPT_DIR, argv[0])
+    try:
+        proc = subprocess.run([path, *argv[1:]], capture_output=True, text=True)
+    except FileNotFoundError:
+        _die(f"required sibling script not found: {path}")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "(no output)"
+        _die(f"{what} failed (exit {proc.returncode}): {detail}")
+    out = proc.stdout.strip()
+    if not out:
+        if allow_empty:
+            return None
+        _die(f"{what} produced no output")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as e:
+        _die(f"{what} returned non-JSON output: {e}: {out[:200]}")
+
+
+def _pr_in_repo(task_id, repo):
+    """Return the task's PR facts for one repo, or None if it has none there."""
+    # find takes --task-id/--repo and exits 0 with empty output when no PR is
+    # linked to the task in that repo yet.
+    found = _run_json(
+        ["factory-pr-meta", "find", "--task-id", task_id, "--repo", repo],
+        "factory-pr-meta find",
+        allow_empty=True,
+    )
+    if not found:
+        return None
+    if not isinstance(found, dict):
+        _die("factory-pr-meta find returned unexpected JSON (expected an object)")
+
+    pr = {
+        "url": found.get("url") or found.get("pr_url"),
+        "number": found.get("number"),
+        "repo": repo,
+        "reviewers": found.get("reviewers", found.get("reviewRequests")),
+        "state": found.get("state"),
+        "mergedAt": found.get("mergedAt"),
+        "merged": found.get("merged"),
+    }
+    if pr["number"] is None and pr["url"]:
+        tail = pr["url"].rstrip("/").rsplit("/", 1)[-1]
+        if tail.isdigit():
+            pr["number"] = int(tail)
+
+    # Authoritative merge state (incl. mergedAt) comes from `factory-pr-meta merged`.
+    if pr["number"] is not None:
+        merged = _run_json(
+            ["factory-pr-meta", "merged", "--repo", repo, "--pr", str(pr["number"])],
+            "factory-pr-meta merged",
+        )
+        if isinstance(merged, dict):
+            pr["state"] = merged.get("state", pr["state"])
+            pr["mergedAt"] = merged.get("mergedAt", pr["mergedAt"])
+            pr["merged"] = merged.get("merged", pr["merged"])
+    return pr
+
+
+def _pr_facts(task_id, repo):
+    """Probe the candidate repo(s) and return the first linked PR's facts."""
+    repos = (repo,) if repo else FACTORY_REPOS
+    if not repos:
+        _die(
+            "no repos to probe: pass --repo, or set target_repos / self_repo in "
+            "foreman/config.json"
+        )
+    for candidate in repos:
+        pr = _pr_in_repo(task_id, candidate)
+        if pr:
+            return pr
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="factory-state",
+        description=(
+            "Emit a single JSON snapshot of a task's externally-mutable PR facts "
+            "(linked PR state/merge/reviewers, or null when none exists). Facts "
+            "only — contains no routing or phase decisions, and does not read the "
+            "task tracker (use factory-tracker-ops for that)."
+        ),
+    )
+    parser.add_argument(
+        "--task-id",
+        dest="task_id",
+        required=True,
+        help="Stable task identifier (the PR<->task link key).",
+    )
+    parser.add_argument(
+        "--repo",
+        help=(
+            "Optional OWNER/REPO hint for the linked PR. When omitted, the "
+            "repos configured in foreman/config.json (target_repos, self_repo) "
+            "are probed."
+        ),
+    )
+    args = parser.parse_args()
+
+    snapshot = {
+        "task_id": args.task_id,
+        "pr": _pr_facts(args.task_id, args.repo),
+    }
+    json.dump(snapshot, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()

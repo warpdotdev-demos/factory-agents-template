@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""factory-validate-config -- structural validation of the factory's configs.
+
+Validates the five config files the factory runs on:
+
+  foreman/config.json          shared run-wide config
+  triage/config.json           per-track dispatch configs
+  spec/config.json
+  implementation/config.json
+  code-review/config.json
+
+Checks, in order:
+  * every file exists, parses as JSON, and is an object;
+  * foreman config has the required keys with the right types: a `tracker`
+    block (provider, non-empty project_routing, default_project inside it,
+    status_map covering all six factory states, issue_type; story_points_field
+    string/null; optional browse_url), a non-empty `target_repos` map whose
+    entries carry description/base_branch/validate_command/test_guidance
+    (optional app_start_command/app_url; unknown fields warn),
+    `default_target_repo` inside target_repos, boolean
+    `spec_approval_required`, and `self_repo`/`self_project`;
+  * each track config has agent.entrypoint_skill, a plain string model, and
+    repos.self;
+  * cross-file consistency: every track's repos.self equals the foreman's
+    self_repo (dispatch derives skill specs from these; a mismatch attaches
+    skills from the wrong repo).
+
+Placeholder policy (the REPLACE_ME convention):
+  * NO placeholders anywhere        -> strict validation; errors fail.
+  * self_repo IS a placeholder      -> pristine template state; placeholder
+    findings are WARNINGS and the exit code stays 0 (a fresh template copy
+    must pass `scripts/check` before it is configured).
+  * self_repo is real but other placeholders remain -> the config is only
+    PARTIALLY filled in; that is an ERROR (finish `scripts/factory-init` or
+    the manual SETUP.md steps).
+
+Emits `{ok, state, errors, warnings}` as JSON to stdout; exits nonzero when
+`ok` is false.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+TRACKS = ("triage", "spec", "implementation", "code-review")
+PLACEHOLDER = "REPLACE_ME"
+FACTORY_STATES = ("Triage", "Todo", "In Progress", "In Review", "Done", "Canceled")
+TARGET_REPO_REQUIRED_FIELDS = (
+    "description",
+    "base_branch",
+    "validate_command",
+    "test_guidance",
+)
+TARGET_REPO_OPTIONAL_FIELDS = ("app_start_command", "app_url")
+
+
+def has_placeholder(value):
+    """True when a JSON value (recursively) contains the placeholder marker."""
+    if isinstance(value, str):
+        return PLACEHOLDER in value
+    if isinstance(value, dict):
+        return any(has_placeholder(k) or has_placeholder(v)
+                   for k, v in value.items())
+    if isinstance(value, list):
+        return any(has_placeholder(v) for v in value)
+    return False
+
+
+def load_json(path, errors):
+    if not os.path.isfile(path):
+        errors.append(f"{path}: missing")
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        errors.append(f"{path}: unreadable or invalid JSON ({e})")
+        return None
+    if not isinstance(data, dict):
+        errors.append(f"{path}: must be a JSON object")
+        return None
+    return data
+
+
+def require_str(obj, key, where, errors, allow_none=False):
+    """Validate obj[key] is a non-empty string; returns the value or None."""
+    val = obj.get(key)
+    if val is None and allow_none:
+        return None
+    if not isinstance(val, str) or not val:
+        errors.append(f"{where}: `{key}` must be a non-empty string"
+                      + (" or null" if allow_none else ""))
+        return None
+    return val
+
+
+def validate_foreman(config, path, errors, warnings):
+    tracker = config.get("tracker")
+    if not isinstance(tracker, dict):
+        errors.append(f"{path}: `tracker` must be an object")
+    else:
+        where = f"{path}: tracker"
+        require_str(tracker, "provider", where, errors)
+        require_str(tracker, "issue_type", where, errors)
+        if "browse_url" in tracker:
+            require_str(tracker, "browse_url", where, errors)
+        spf = tracker.get("story_points_field")
+        if spf is not None and (not isinstance(spf, str) or not spf):
+            errors.append(f"{where}: `story_points_field` must be a non-empty "
+                          "string or null")
+        routing = tracker.get("project_routing")
+        if (not isinstance(routing, dict) or not routing
+                or not all(isinstance(k, str) and isinstance(v, str) and k and v
+                           for k, v in routing.items())):
+            errors.append(f"{where}: `project_routing` must be a non-empty map "
+                          "of project key -> description")
+            routing = {}
+        default_project = require_str(tracker, "default_project", where, errors)
+        if default_project and routing and default_project not in routing:
+            errors.append(f"{where}: `default_project` {default_project!r} is "
+                          "not a `project_routing` key")
+        status_map = tracker.get("status_map")
+        if not isinstance(status_map, dict):
+            errors.append(f"{where}: `status_map` must be an object")
+        else:
+            for state in FACTORY_STATES:
+                if not isinstance(status_map.get(state), str) or not status_map.get(state):
+                    errors.append(f"{where}: `status_map` is missing (or has a "
+                                  f"non-string value for) factory state {state!r}")
+            for state in status_map:
+                if state not in FACTORY_STATES:
+                    warnings.append(f"{where}: `status_map` has unknown factory "
+                                    f"state {state!r}")
+
+    target_repos = config.get("target_repos")
+    if not isinstance(target_repos, dict) or not target_repos:
+        errors.append(f"{path}: `target_repos` must be a non-empty map of "
+                      "org/repo -> settings")
+        target_repos = {}
+    for repo, entry in target_repos.items():
+        where = f"{path}: target_repos[{repo!r}]"
+        if "/" not in repo:
+            errors.append(f"{where}: key must be org/repo")
+        if not isinstance(entry, dict):
+            errors.append(f"{where}: must be an object")
+            continue
+        for field in TARGET_REPO_REQUIRED_FIELDS:
+            require_str(entry, field, where, errors)
+        for field in TARGET_REPO_OPTIONAL_FIELDS:
+            if field in entry:
+                require_str(entry, field, where, errors)
+        for field in entry:
+            if field not in TARGET_REPO_REQUIRED_FIELDS + TARGET_REPO_OPTIONAL_FIELDS:
+                warnings.append(f"{where}: unknown field {field!r}")
+
+    default_target = require_str(config, "default_target_repo", path, errors)
+    if default_target and target_repos and default_target not in target_repos:
+        errors.append(f"{path}: `default_target_repo` {default_target!r} is not "
+                      "a `target_repos` key")
+
+    if not isinstance(config.get("spec_approval_required"), bool):
+        errors.append(f"{path}: `spec_approval_required` must be a boolean")
+
+    self_repo = require_str(config, "self_repo", path, errors)
+    if self_repo and "/" not in self_repo:
+        errors.append(f"{path}: `self_repo` must be org/repo")
+    require_str(config, "self_project", path, errors)
+    return self_repo
+
+
+def validate_track(track, config, path, errors):
+    agent = config.get("agent")
+    if not isinstance(agent, dict) or not isinstance(agent.get("entrypoint_skill"), str) \
+            or not agent.get("entrypoint_skill"):
+        errors.append(f"{path}: `agent.entrypoint_skill` must be a non-empty string")
+    model = config.get("model")
+    if not isinstance(model, str) or not model:
+        errors.append(f"{path}: `model` must be a plain non-empty model-id string")
+    repos = config.get("repos")
+    repo_self = repos.get("self") if isinstance(repos, dict) else None
+    if not isinstance(repo_self, str) or not repo_self:
+        errors.append(f"{path}: `repos.self` must be a non-empty org/repo string")
+        return None
+    return repo_self
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="factory-validate-config",
+        description=(
+            "Validate foreman/config.json and the four track configs: required "
+            "keys and types, cross-file repos.self/self_repo consistency, and "
+            "the REPLACE_ME placeholder policy (pristine template warns; a "
+            "partially-configured repo fails)."
+        ),
+    )
+    parser.add_argument("--repo-root", default=DEFAULT_REPO_ROOT,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    errors, warnings = [], []
+
+    foreman_path = os.path.join(args.repo_root, "foreman", "config.json")
+    foreman = load_json(foreman_path, errors)
+    self_repo = None
+    placeholder_hits = []
+    if foreman is not None:
+        self_repo = validate_foreman(foreman, foreman_path, errors, warnings)
+        if has_placeholder(foreman):
+            placeholder_hits.append(foreman_path)
+
+    track_selves = {}
+    for track in TRACKS:
+        path = os.path.join(args.repo_root, track, "config.json")
+        config = load_json(path, errors)
+        if config is None:
+            continue
+        repo_self = validate_track(track, config, path, errors)
+        if repo_self:
+            track_selves[path] = repo_self
+        if has_placeholder(config):
+            placeholder_hits.append(path)
+
+    if self_repo:
+        for path, repo_self in track_selves.items():
+            if repo_self != self_repo:
+                errors.append(
+                    f"{path}: `repos.self` ({repo_self!r}) does not match the "
+                    f"foreman config's `self_repo` ({self_repo!r}); dispatch "
+                    "would attach skills from the wrong repo"
+                )
+
+    # Placeholder policy: pristine template warns; partially filled fails.
+    state = "configured"
+    if placeholder_hits:
+        # Pristine = the repo's own identity (`self_repo`) is still the
+        # placeholder; once it is real, remaining placeholders mean the setup
+        # was only partially completed.
+        pristine = self_repo is None or PLACEHOLDER in self_repo
+        if pristine:
+            state = "pristine-template"
+            warnings.append(
+                "config still contains REPLACE_ME placeholders in: "
+                + ", ".join(placeholder_hits)
+                + " - run scripts/factory-init (or follow SETUP.md) before "
+                "using the factory"
+            )
+        else:
+            state = "partially-configured"
+            errors.append(
+                "`self_repo` is set but REPLACE_ME placeholders remain in: "
+                + ", ".join(placeholder_hits)
+                + " - finish scripts/factory-init (or the SETUP.md steps)"
+            )
+
+    ok = not errors
+    print(json.dumps({"ok": ok, "state": state, "errors": errors,
+                      "warnings": warnings}, indent=2))
+    if warnings:
+        for w in warnings:
+            sys.stderr.write(f"factory-validate-config: warning: {w}\n")
+    if not ok:
+        for e in errors:
+            sys.stderr.write(f"factory-validate-config: error: {e}\n")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

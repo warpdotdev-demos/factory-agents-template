@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+"""jira -- unified Jira Cloud CLI for the factory loop.
+
+One deterministic entrypoint over the Jira Cloud REST API (v3), mirroring the
+command surface the factory agents rely on (see `scripts/tracker`, the
+provider-agnostic seam, and `scripts/mock-issue-tracker`, the eval stand-in).
+Emits FACTS as JSON to stdout, or fails loudly (nonzero exit + human-readable
+stderr).
+
+This is a thin mechanic, not a decision-maker: it does no routing/judgment.
+The factory agents read/update the tracker through `scripts/tracker`, which
+delegates here when the provider is `jira` (the default).
+
+Subcommands:
+  create-issue    Create a new issue and print its key/url/id.
+  comment         Post a comment on an issue (markdown, converted to ADF).
+  update-comment  Update (edit) an existing comment on an issue.
+  attach-pr       Attach a PR URL to an issue as a Jira remote link.
+  list-labels     List labels in use (informational; Jira labels are free-form).
+  search-issues   JQL keyword-search open (unresolved) issues for deduplication.
+  get-issue       Read one issue's status, labels, estimate, priority, people.
+  update-issue    Set an issue's status, estimate, title, add/remove labels,
+                  and/or set/append its description.
+  find-user       Look up Jira users by email or display name; prints each
+                  match's accountId and ready-to-use mention token.
+
+Jira mechanics encapsulated here so callers never see them:
+  * Status is transition-based. Subcommands accept the FACTORY lifecycle state
+    name (Triage, Todo, In Progress, In Review, Done, Canceled); it is mapped
+    to the customer's real Jira status name via `tracker.status_map` in the
+    foreman config (`foreman/config.json`), then the matching transition from
+    GET /issue/{key}/transitions is executed (case-insensitive match on the
+    transition's target status). If the mapped status is unreachable, this
+    fails loudly listing the available transitions. A status name not in the
+    map is used as-is.
+  * Descriptions and comments are authored in markdown; a small built-in
+    converter renders them to ADF (Atlassian Document Format). Reads convert
+    ADF back to markdown-ish plain text (lossy for exotic nodes).
+  * User mentions: write `[~accountid:<accountId>]` (Jira's own mention
+    syntax) in any markdown body; the converter emits a real ADF `mention`
+    node, which renders as a clickable @-mention and notifies the person.
+    Resolve an accountId from an email or name with `find-user`.
+  * Estimate = story points, stored in the custom field named by
+    `tracker.story_points_field`. Setting that key explicitly to null (or "")
+    DISABLES estimates — for projects with no editable story-points field —
+    so estimate writes are skipped with a stderr warning instead of failing
+    the whole API call, and reads report estimate null. Priority uses Jira
+    priority names.
+  * `--team` is the routing area = Jira **project key** (default from
+    `tracker.default_project`); the issue type comes from `tracker.issue_type`.
+
+Output-shape notes: issue facts carry both `key` and `identifier` (same
+value), and get-issue carries both `reporter` and `requester` (same value), so
+callers written against either this provider or the mock/Linear-era shapes
+keep working. People include `accountId` and `email` when the API returns
+them; Jira Cloud often hides emails, in which case `email` is null.
+
+Auth (env-only, never printed):
+  $JIRA_BASE_URL   e.g. https://yourcompany.atlassian.net — or, for SCOPED API
+                   tokens that Atlassian only accepts at the cloud-ID gateway,
+                   https://api.atlassian.com/ex/jira/<cloudId>
+  $JIRA_EMAIL      the API user's email
+  $JIRA_API_TOKEN  an Atlassian API token for that user
+
+Human-facing issue links: when $JIRA_BASE_URL is the api.atlassian.com gateway,
+its URLs are not clickable for humans, so browse links use (first set wins)
+$JIRA_BROWSE_URL -> `tracker.browse_url` in foreman/config.json ->
+$JIRA_BASE_URL. Set `tracker.browse_url` to the real site URL
+(https://yourcompany.atlassian.net) when the API goes through the gateway.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BASE_URL_ENV = "JIRA_BASE_URL"
+EMAIL_ENV = "JIRA_EMAIL"
+TOKEN_ENV = "JIRA_API_TOKEN"
+
+# All tracker behavior knobs live in exactly one place: the foreman config
+# (foreman/config.json), under "tracker". Resolved relative to this script so
+# it works from any CWD. Missing/unreadable config degrades to safe built-ins.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_FOREMAN_CONFIG = os.path.join(_REPO_ROOT, "foreman", "config.json")
+
+_BUILTIN_STORY_POINTS_FIELD = "customfield_10016"
+_BUILTIN_ISSUE_TYPE = "Task"
+
+# Common words to exclude from keyword matching in search-issues.
+_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "is", "it", "not", "be", "as", "by", "are", "was",
+    "me", "my", "i", "we", "do", "did", "has", "have",
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def _tracker_config():
+    """Best-effort read of the foreman config's `tracker` block; {} if absent."""
+    try:
+        with open(_FOREMAN_CONFIG, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    tracker = data.get("tracker")
+    return tracker if isinstance(tracker, dict) else {}
+
+
+_CONFIG = _tracker_config()
+
+
+def _config_str(key, fallback=None):
+    val = _CONFIG.get(key)
+    return val if isinstance(val, str) and val else fallback
+
+
+def _story_points_field():
+    """Resolve the story-points custom field id from config.
+
+    Three cases:
+      * key absent           -> the common built-in default (customfield_10016)
+      * non-empty string     -> that field id
+      * explicitly null / "" -> story points DISABLED for this tracker (some
+        Jira projects have no editable story-points field). Estimate writes
+        are skipped with a stderr warning and reads report estimate null.
+    """
+    if "story_points_field" in _CONFIG:
+        val = _CONFIG.get("story_points_field")
+        if isinstance(val, str) and val:
+            return val
+        return None
+    return _BUILTIN_STORY_POINTS_FIELD
+
+
+DEFAULT_PROJECT = _config_str("default_project")
+ISSUE_TYPE = _config_str("issue_type", _BUILTIN_ISSUE_TYPE)
+STORY_POINTS_FIELD = _story_points_field()
+STATUS_MAP = _CONFIG.get("status_map") if isinstance(_CONFIG.get("status_map"), dict) else {}
+
+
+def _warn_estimate_disabled():
+    sys.stderr.write(
+        "warning: story points are disabled (tracker.story_points_field is "
+        "null in foreman/config.json); skipping --estimate - record the "
+        "estimate in the issue description or a comment instead\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP transport (Basic auth from env; token never printed)
+# ---------------------------------------------------------------------------
+
+def _base_url():
+    base = os.environ.get(BASE_URL_ENV, "").strip().rstrip("/")
+    if not base:
+        die(f"${BASE_URL_ENV} is not set; export your Jira site URL "
+            "(e.g. https://yourcompany.atlassian.net) to use this CLI")
+    return base
+
+
+def _auth_header():
+    email = os.environ.get(EMAIL_ENV, "").strip()
+    token = os.environ.get(TOKEN_ENV, "")
+    missing = [name for name, val in ((EMAIL_ENV, email), (TOKEN_ENV, token)) if not val]
+    if missing:
+        die("missing required environment variable(s): "
+            + ", ".join("$" + m for m in missing)
+            + "; export your Jira email and API token to use this CLI")
+    raw = f"{email}:{token}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def api(method, path, payload=None, query=None):
+    """Call the Jira Cloud REST API v3 and return the parsed JSON body.
+
+    Fails loudly on transport errors, non-2xx responses, or non-JSON bodies.
+    Returns {} for empty (e.g. 204) responses.
+    """
+    url = _base_url() + "/rest/api/3/" + path.lstrip("/")
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": _auth_header(),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace").strip() if e.fp else ""
+        die(f"Jira API HTTP {e.code} for {method} /{path.lstrip('/')}: {detail or e.reason}")
+    except urllib.error.URLError as e:
+        die(f"Jira API request failed: {e.reason}")
+
+    if not body.strip():
+        return {}
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        die("Jira API returned non-JSON response:\n" + body[:500])
+
+
+def _browse_base():
+    """Base URL for human-facing issue links.
+
+    Order: $JIRA_BROWSE_URL -> tracker.browse_url (foreman/config.json) ->
+    $JIRA_BASE_URL. Needed when API calls go through the
+    api.atlassian.com/ex/jira/<cloudId> gateway (scoped API tokens): gateway
+    URLs are not human-clickable, so the real site URL belongs in
+    tracker.browse_url.
+    """
+    env_val = os.environ.get("JIRA_BROWSE_URL", "").strip().rstrip("/")
+    if env_val:
+        return env_val
+    config_val = _config_str("browse_url")
+    if config_val:
+        return config_val.rstrip("/")
+    return _base_url()
+
+
+def _browse_url(key):
+    return f"{_browse_base()}/browse/{key}"
+
+
+def _person(user):
+    """{accountId, name, email} from a Jira user object; email is often hidden
+    by Jira Cloud privacy settings, in which case it is null."""
+    if not isinstance(user, dict):
+        return None
+    return {
+        "accountId": user.get("accountId"),
+        "name": user.get("displayName"),
+        "email": user.get("emailAddress"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# markdown -> ADF (pure; unit-tested without network)
+# ---------------------------------------------------------------------------
+
+_INLINE_TOKEN_RE = re.compile(
+    r"(`[^`]+`"                       # inline code (wins; protects its contents)
+    r"|<https?://[^>\s]+>"            # autolink: <url>
+    # bare URL; must end on a non-punctuation char so trailing prose
+    # punctuation (e.g. "see https://x.com.") stays outside the link
+    r"|https?://[^\s<>]*[^\s<>.,;:!?'\"\)\]}]"
+    r"|\*\*[^*]+\*\*"                 # bold
+    r"|\*[^*\s][^*]*\*"               # italic (asterisk)
+    r"|(?<![\w])_[^_]+_(?![\w])"      # italic (underscore, not intra-word)
+    r"|\[~accountid:[^\]\s]+\]"       # user mention (Jira syntax)
+    r"|\[[^\]]+\]\([^)\s]+\))"        # [text](url)
+)
+
+_MENTION_PREFIX = "[~accountid:"
+
+_HEADING_RE = re.compile(r"(#{1,6})\s+(.*)$")
+_BULLET_RE = re.compile(r"[-*]\s+(.*)$")
+_ORDERED_RE = re.compile(r"\d+[.)]\s+(.*)$")
+_FENCE_RE = re.compile(r"```(\S*)\s*$")
+
+
+def _text_node(text, marks=None):
+    node = {"type": "text", "text": text}
+    if marks:
+        node["marks"] = list(marks)
+    return node
+
+
+def _inline_nodes(text, marks=None):
+    """Parse inline markdown into ADF text nodes with marks."""
+    marks = marks or []
+    nodes = []
+    pos = 0
+    for m in _INLINE_TOKEN_RE.finditer(text):
+        if m.start() > pos:
+            nodes.append(_text_node(text[pos:m.start()], marks))
+        tok = m.group(0)
+        if tok.startswith("`"):
+            nodes.append(_text_node(tok[1:-1], marks + [{"type": "code"}]))
+        elif tok.startswith("**"):
+            nodes.extend(_inline_nodes(tok[2:-2], marks + [{"type": "strong"}]))
+        elif tok.startswith(_MENTION_PREFIX):  # [~accountid:...] user mention
+            account_id = tok[len(_MENTION_PREFIX):-1]
+            nodes.append({"type": "mention", "attrs": {"id": account_id}})
+        elif tok.startswith("["):
+            bracket = tok.index("](")
+            label, href = tok[1:bracket], tok[bracket + 2:-1]
+            nodes.extend(_inline_nodes(label, marks + [{"type": "link", "attrs": {"href": href}}]))
+        elif tok.startswith("<"):  # <url> autolink
+            href = tok[1:-1]
+            nodes.append(_text_node(href, marks + [{"type": "link", "attrs": {"href": href}}]))
+        elif tok.startswith(("http://", "https://")):  # bare URL
+            nodes.append(_text_node(tok, marks + [{"type": "link", "attrs": {"href": tok}}]))
+        else:  # *italic* or _italic_
+            nodes.extend(_inline_nodes(tok[1:-1], marks + [{"type": "em"}]))
+        pos = m.end()
+    if pos < len(text):
+        nodes.append(_text_node(text[pos:], marks))
+    return [n for n in nodes if n.get("type") != "text" or n.get("text")]
+
+
+def _paragraph(text):
+    return {"type": "paragraph", "content": _inline_nodes(text)}
+
+
+def _list_item(text):
+    return {"type": "listItem", "content": [_paragraph(text)]}
+
+
+def markdown_to_adf(markdown):
+    """Convert a practical subset of markdown to an ADF document.
+
+    Handles paragraphs, #..###### headings, bold/italic/inline code, links
+    ([text](url), <url> autolinks, and bare http(s):// URLs), bullet and
+    numbered lists, and fenced code blocks. Anything else is treated as
+    paragraph text. Pure function; safe to unit-test offline.
+    """
+    lines = (markdown or "").replace("\r\n", "\n").split("\n")
+    content = []
+    para = []
+
+    def flush_para():
+        if para:
+            text = " ".join(para).strip()
+            if text:
+                content.append(_paragraph(text))
+            del para[:]
+
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        fence = _FENCE_RE.match(stripped)
+        if fence:
+            flush_para()
+            language = fence.group(1)
+            code_lines = []
+            i += 1
+            while i < len(lines) and not _FENCE_RE.match(lines[i].strip()):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip the closing fence (or run off the end)
+            block = {"type": "codeBlock"}
+            if language:
+                block["attrs"] = {"language": language}
+            code_text = "\n".join(code_lines)
+            block["content"] = [{"type": "text", "text": code_text}] if code_text else []
+            content.append(block)
+            continue
+
+        heading = _HEADING_RE.match(stripped)
+        if heading:
+            flush_para()
+            content.append({
+                "type": "heading",
+                "attrs": {"level": len(heading.group(1))},
+                "content": _inline_nodes(heading.group(2).strip()),
+            })
+            i += 1
+            continue
+
+        if _BULLET_RE.match(stripped):
+            flush_para()
+            items = []
+            while i < len(lines):
+                m = _BULLET_RE.match(lines[i].strip())
+                if not m:
+                    break
+                items.append(_list_item(m.group(1).strip()))
+                i += 1
+            content.append({"type": "bulletList", "content": items})
+            continue
+
+        if _ORDERED_RE.match(stripped):
+            flush_para()
+            items = []
+            while i < len(lines):
+                m = _ORDERED_RE.match(lines[i].strip())
+                if not m:
+                    break
+                items.append(_list_item(m.group(1).strip()))
+                i += 1
+            content.append({"type": "orderedList", "content": items})
+            continue
+
+        if not stripped:
+            flush_para()
+        else:
+            para.append(stripped)
+        i += 1
+
+    flush_para()
+    return {"type": "doc", "version": 1, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# ADF -> markdown-ish text (pure; for reading descriptions back)
+# ---------------------------------------------------------------------------
+
+def _inline_text(node):
+    parts = []
+    for child in node.get("content") or []:
+        ctype = child.get("type")
+        if ctype == "text":
+            text = child.get("text", "")
+            for mark in child.get("marks") or []:
+                mtype = mark.get("type")
+                if mtype == "code":
+                    text = f"`{text}`"
+                elif mtype == "strong":
+                    text = f"**{text}**"
+                elif mtype == "em":
+                    text = f"*{text}*"
+                elif mtype == "link":
+                    href = (mark.get("attrs") or {}).get("href", "")
+                    # A self-link (text == href) reads back as the bare URL;
+                    # markdown_to_adf re-linkifies it on the next write.
+                    if href != text:
+                        text = f"[{text}]({href})"
+            parts.append(text)
+        elif ctype == "hardBreak":
+            parts.append("\n")
+        elif ctype == "mention":
+            attrs = child.get("attrs") or {}
+            # Prefer the rendered display text ("@Name"); fall back to the
+            # mention token so round-trips stay mention-preserving.
+            parts.append(attrs.get("text") or f"[~accountid:{attrs.get('id', '')}]")
+        elif ctype == "emoji":
+            parts.append((child.get("attrs") or {}).get("shortName", ""))
+        else:
+            parts.append(_inline_text(child))
+    return "".join(parts)
+
+
+def _block_text(node):
+    ntype = node.get("type")
+    if ntype == "paragraph":
+        return _inline_text(node)
+    if ntype == "heading":
+        level = (node.get("attrs") or {}).get("level") or 1
+        return "#" * int(level) + " " + _inline_text(node)
+    if ntype == "codeBlock":
+        language = (node.get("attrs") or {}).get("language") or ""
+        code = "".join(c.get("text", "") for c in node.get("content") or [])
+        return f"```{language}\n{code}\n```"
+    if ntype == "bulletList":
+        return "\n".join("- " + _item_text(item) for item in node.get("content") or [])
+    if ntype == "orderedList":
+        return "\n".join(
+            f"{n}. " + _item_text(item)
+            for n, item in enumerate(node.get("content") or [], start=1)
+        )
+    if ntype == "blockquote":
+        inner = "\n\n".join(filter(None, (_block_text(c) for c in node.get("content") or [])))
+        return "\n".join("> " + line for line in inner.split("\n"))
+    if ntype == "rule":
+        return "---"
+    # Unknown block: best effort on its children.
+    return "\n\n".join(filter(None, (_block_text(c) for c in node.get("content") or []))) \
+        or _inline_text(node)
+
+
+def _item_text(item):
+    return "\n  ".join(filter(None, (_block_text(c) for c in item.get("content") or [])))
+
+
+def adf_to_text(node):
+    """Render an ADF document (or fragment) to markdown-ish plain text."""
+    if not isinstance(node, dict):
+        return ""
+    return "\n\n".join(filter(None, (_block_text(c) for c in node.get("content") or [])))
+
+
+# ---------------------------------------------------------------------------
+# Status mechanics (factory state -> Jira status -> transition)
+# ---------------------------------------------------------------------------
+
+def resolve_status_name(factory_state, status_map=None):
+    """Map a factory lifecycle state to the customer's Jira status name.
+
+    Case-insensitive lookup in the config `tracker.status_map`; a name not in
+    the map is used as-is (so passing a real Jira status name also works).
+    """
+    status_map = STATUS_MAP if status_map is None else status_map
+    target = (factory_state or "").strip()
+    for name, mapped in status_map.items():
+        if str(name).strip().lower() == target.lower() and isinstance(mapped, str) and mapped:
+            return mapped
+    return target
+
+
+def select_transition(transitions, target_status_name):
+    """Pick the transition whose destination status matches, case-insensitively.
+
+    `transitions` is the `transitions` array from GET /issue/{key}/transitions.
+    Returns the matching transition dict, or None.
+    """
+    target = (target_status_name or "").strip().lower()
+    for transition in transitions or []:
+        to = transition.get("to") or {}
+        if str(to.get("name", "")).strip().lower() == target:
+            return transition
+    return None
+
+
+def transition_issue(key, factory_state, current_status=None):
+    """Move an issue to the Jira status mapped from a factory state.
+
+    No-op when the issue is already in the target status. Fails loudly,
+    listing the available transitions, when the target is unreachable from
+    the issue's current status.
+    """
+    status_name = resolve_status_name(factory_state)
+    if current_status and current_status.strip().lower() == status_name.strip().lower():
+        return status_name
+
+    data = api("GET", f"issue/{urllib.parse.quote(key)}/transitions")
+    transitions = data.get("transitions") or []
+    chosen = select_transition(transitions, status_name)
+    if chosen is None:
+        if current_status is None:
+            cur = api("GET", f"issue/{urllib.parse.quote(key)}", query={"fields": "status"})
+            cur_name = ((cur.get("fields") or {}).get("status") or {}).get("name") or ""
+            if cur_name.strip().lower() == status_name.strip().lower():
+                return status_name
+        available = ", ".join(
+            f"{t.get('name')} -> {(t.get('to') or {}).get('name')}" for t in transitions
+        ) or "(none)"
+        die(
+            f"cannot move {key} to status {status_name!r} (factory state {factory_state!r}): "
+            f"no matching transition from its current status. Available transitions: {available}"
+        )
+    api("POST", f"issue/{urllib.parse.quote(key)}/transitions",
+        {"transition": {"id": str(chosen.get("id"))}})
+    return status_name
+
+
+# ---------------------------------------------------------------------------
+# JQL construction (pure; unit-tested without network)
+# ---------------------------------------------------------------------------
+
+def _keywords(query_text):
+    """Significant keywords from query_text (drop stop words and short tokens)."""
+    return [w for w in query_text.lower().split() if w not in _STOP_WORDS and len(w) > 2]
+
+
+def _jql_quote(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def build_search_jql(query_text, project=None):
+    """JQL for keyword search over open (not-Done-category) issues."""
+    keywords = _keywords(query_text)
+    if not keywords and query_text.strip():
+        keywords = [query_text.strip().lower()]
+    clauses = []
+    if project:
+        clauses.append(f"project = {_jql_quote(project)}")
+    clauses.append("statusCategory != Done")
+    if keywords:
+        text_clause = " OR ".join(f"text ~ {_jql_quote(kw)}" for kw in keywords)
+        clauses.append(f"({text_clause})")
+    return " AND ".join(clauses) + " ORDER BY updated DESC"
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_create_issue(args):
+    project = (args.team or DEFAULT_PROJECT or "").strip()
+    if not project:
+        die("no Jira project key: pass --team or set tracker.default_project "
+            "in foreman/config.json")
+
+    fields = {
+        "project": {"key": project},
+        "summary": args.title,
+        "issuetype": {"name": ISSUE_TYPE},
+        "description": markdown_to_adf(args.description),
+    }
+    if args.labels:
+        names = [l.strip() for l in args.labels.split(",") if l.strip()]
+        if names:
+            fields["labels"] = names
+    if args.estimate is not None:
+        if STORY_POINTS_FIELD:
+            fields[STORY_POINTS_FIELD] = args.estimate
+        else:
+            _warn_estimate_disabled()
+    if args.parent:
+        fields["parent"] = {"key": args.parent.strip()}
+    if args.priority:
+        fields["priority"] = {"name": args.priority}
+
+    created = api("POST", "issue", {"fields": fields})
+    key = created.get("key")
+    if not key:
+        die("issue create returned no key: " + json.dumps(created))
+
+    if args.status:
+        transition_issue(key, args.status)
+
+    print(json.dumps({
+        "key": key,
+        "identifier": key,
+        "url": _browse_url(key),
+        "id": created.get("id"),
+    }, indent=2))
+    return 0
+
+
+def cmd_get_issue(args):
+    key = args.key.strip()
+    field_names = ["summary", "description", "status", "labels", "priority",
+                   "reporter", "assignee"]
+    if STORY_POINTS_FIELD:
+        field_names.append(STORY_POINTS_FIELD)
+    data = api("GET", f"issue/{urllib.parse.quote(key)}",
+               query={"fields": ",".join(field_names)})
+    fields = data.get("fields") or {}
+    status = fields.get("status") or {}
+    reporter = _person(fields.get("reporter"))
+    resolved_key = data.get("key") or key
+    print(json.dumps({
+        "key": resolved_key,
+        "identifier": resolved_key,
+        "url": _browse_url(resolved_key),
+        "title": fields.get("summary"),
+        "description": adf_to_text(fields.get("description")) if fields.get("description") else None,
+        "status": status.get("name"),
+        "statusCategory": (status.get("statusCategory") or {}).get("name"),
+        "labels": fields.get("labels") or [],
+        "estimate": fields.get(STORY_POINTS_FIELD) if STORY_POINTS_FIELD else None,
+        "priority": (fields.get("priority") or {}).get("name"),
+        "assignee": _person(fields.get("assignee")),
+        "reporter": reporter,
+        "requester": reporter,
+    }, indent=2))
+    return 0
+
+
+def cmd_search_issues(args):
+    project = (args.team or DEFAULT_PROJECT or "").strip() or None
+    jql = build_search_jql(args.query_text, project)
+    data = api("GET", "search/jql",
+               query={"jql": jql, "fields": "summary,status", "maxResults": 20})
+    results = []
+    for issue in data.get("issues") or []:
+        fields = issue.get("fields") or {}
+        status = (fields.get("status") or {}).get("name")
+        results.append({
+            "key": issue.get("key"),
+            "identifier": issue.get("key"),
+            "title": fields.get("summary"),
+            "status": status,
+            "state": status,
+            "url": _browse_url(issue.get("key")),
+        })
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+def cmd_comment(args):
+    key = args.issue.strip()
+    data = api("POST", f"issue/{urllib.parse.quote(key)}/comment",
+               {"body": markdown_to_adf(args.body)})
+    comment_id = data.get("id")
+    issue_url = _browse_url(key)
+    print(json.dumps({
+        "id": comment_id,
+        "issue": key,
+        "issueUrl": issue_url,
+        "url": f"{issue_url}?focusedCommentId={comment_id}" if comment_id else issue_url,
+        "body": args.body,
+    }, indent=2))
+    return 0
+
+
+def cmd_update_comment(args):
+    key = args.issue.strip()
+    comment_id = args.comment_id.strip()
+    data = api("PUT", f"issue/{urllib.parse.quote(key)}/comment/{urllib.parse.quote(comment_id)}",
+               {"body": markdown_to_adf(args.body)})
+    updated_id = data.get("id") or comment_id
+    issue_url = _browse_url(key)
+    print(json.dumps({
+        "id": updated_id,
+        "issue": key,
+        "issueUrl": issue_url,
+        "url": f"{issue_url}?focusedCommentId={updated_id}" if updated_id else issue_url,
+        "body": args.body,
+    }, indent=2))
+    return 0
+
+
+def cmd_attach_pr(args):
+    key = args.issue.strip()
+    url = args.url.strip()
+    title = args.title or (
+        url.rstrip("/").rsplit("/", 2)[-2] + " " + url.rstrip("/").rsplit("/", 1)[-1]
+    )
+    data = api("POST", f"issue/{urllib.parse.quote(key)}/remotelink",
+               {"object": {"url": url, "title": title}})
+    print(json.dumps({
+        "id": data.get("id"),
+        "title": title,
+        "url": url,
+        "issue": key,
+    }, indent=2))
+    return 0
+
+
+def cmd_update_issue(args):
+    add_labels = [l.strip() for l in (args.add_label or []) if l.strip()]
+    remove_labels = [l.strip() for l in (args.remove_label or []) if l.strip()]
+    if args.description is not None and args.append_description is not None:
+        die("update-issue: --description and --append-description are mutually exclusive")
+    has_description = args.description is not None or args.append_description is not None
+    if (
+        not args.status
+        and args.estimate is None
+        and not add_labels
+        and not remove_labels
+        and not has_description
+        and args.title is None
+    ):
+        die(
+            "update-issue: provide at least one of --status, --estimate, "
+            "--add-label, --remove-label, --description, --append-description, --title"
+        )
+
+    key = args.key.strip()
+    field_names = ["summary", "description", "status", "labels"]
+    if STORY_POINTS_FIELD:
+        field_names.append(STORY_POINTS_FIELD)
+    current = api("GET", f"issue/{urllib.parse.quote(key)}",
+                  query={"fields": ",".join(field_names)})
+    current_fields = current.get("fields") or {}
+    current_status = (current_fields.get("status") or {}).get("name")
+
+    fields_payload = {}
+    if args.title is not None:
+        fields_payload["summary"] = args.title
+    if args.estimate is not None:
+        if STORY_POINTS_FIELD:
+            fields_payload[STORY_POINTS_FIELD] = args.estimate
+        else:
+            _warn_estimate_disabled()
+    if args.description is not None:
+        fields_payload["description"] = markdown_to_adf(args.description)
+    elif args.append_description is not None:
+        existing = adf_to_text(current_fields.get("description")) \
+            if current_fields.get("description") else ""
+        combined = (
+            existing + "\n\n" + args.append_description if existing else args.append_description
+        )
+        fields_payload["description"] = markdown_to_adf(combined)
+
+    # Label edits are a delta against the issue's current labels, preserving
+    # everything else (Jira `update` add/remove operations, not a full rewrite).
+    update_ops = {}
+    if add_labels or remove_labels:
+        current_labels = current_fields.get("labels") or []
+        lowered = {l.lower(): l for l in current_labels}
+        ops = []
+        for name in add_labels:
+            if name.lower() not in lowered:
+                ops.append({"add": name})
+        for name in remove_labels:
+            existing_label = lowered.get(name.lower())
+            if existing_label is not None:
+                ops.append({"remove": existing_label})
+            else:
+                sys.stderr.write(f"warning: label not on issue, nothing to remove: {name!r}\n")
+        if ops:
+            update_ops["labels"] = ops
+
+    payload = {}
+    if fields_payload:
+        payload["fields"] = fields_payload
+    if update_ops:
+        payload["update"] = update_ops
+    if payload:
+        api("PUT", f"issue/{urllib.parse.quote(key)}", payload)
+
+    if args.status:
+        transition_issue(key, args.status, current_status=current_status)
+
+    # Re-read so the printed FACTS reflect the tracker's actual final state.
+    final = api("GET", f"issue/{urllib.parse.quote(key)}",
+                query={"fields": ",".join(field_names)})
+    final_fields = final.get("fields") or {}
+    final_status = final_fields.get("status") or {}
+    resolved_key = final.get("key") or key
+    print(json.dumps({
+        "key": resolved_key,
+        "identifier": resolved_key,
+        "url": _browse_url(resolved_key),
+        "title": final_fields.get("summary"),
+        "status": final_status.get("name"),
+        "statusCategory": (final_status.get("statusCategory") or {}).get("name"),
+        "estimate": final_fields.get(STORY_POINTS_FIELD) if STORY_POINTS_FIELD else None,
+        "labels": final_fields.get("labels") or [],
+        "description": adf_to_text(final_fields.get("description"))
+        if final_fields.get("description") else None,
+    }, indent=2))
+    return 0
+
+
+def cmd_find_user(args):
+    """Look up Jira users by email or display name (GET /user/search).
+
+    Prints a JSON array of matches, each with the accountId, display name,
+    email (often hidden by Jira Cloud privacy settings), active flag, and a
+    ready-to-paste `mention` token (`[~accountid:...]`) for markdown bodies.
+    App/bot accounts are excluded.
+    """
+    query = args.query.strip()
+    if not query:
+        die("find-user: provide a non-empty email or display name")
+    data = api("GET", "user/search", query={"query": query, "maxResults": 20})
+    results = []
+    for user in data if isinstance(data, list) else []:
+        if not isinstance(user, dict):
+            continue
+        if user.get("accountType") not in (None, "atlassian"):
+            continue  # skip app/bot and portal-customer accounts
+        account_id = user.get("accountId")
+        if not account_id:
+            continue
+        results.append({
+            "accountId": account_id,
+            "name": user.get("displayName"),
+            "email": user.get("emailAddress"),
+            "active": user.get("active"),
+            "mention": f"[~accountid:{account_id}]",
+        })
+    print(json.dumps(results, indent=2))
+    return 0
+
+
+def cmd_list_labels(args):
+    labels = []
+    start_at = 0
+    while True:
+        data = api("GET", "label", query={"startAt": start_at, "maxResults": 1000})
+        values = data.get("values") or []
+        labels.extend(v for v in values if isinstance(v, str))
+        if data.get("isLast", True) or not values:
+            break
+        start_at += len(values)
+    print(json.dumps([{"name": name} for name in sorted(set(labels))], indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="jira",
+        description=(
+            "Unified Jira Cloud CLI for the factory loop: create-issue, comment, "
+            "update-comment, attach-pr, list-labels, search-issues, get-issue, "
+            "update-issue, find-user. Auth via $JIRA_BASE_URL, $JIRA_EMAIL, "
+            "$JIRA_API_TOKEN."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    factory_states = 'Triage, Todo, "In Progress", "In Review", Done, Canceled'
+
+    p_create = sub.add_parser("create-issue", help="Create a new Jira issue.")
+    p_create.add_argument("--title", required=True, help="Issue summary/title.")
+    p_create.add_argument("--description", required=True,
+                          help="Issue description (markdown; converted to ADF).")
+    p_create.add_argument(
+        "--team",
+        default=None,
+        help=(
+            "Routing area = Jira project key (e.g. PROJ). Default: "
+            "tracker.default_project from foreman/config.json"
+            + (f" (currently {DEFAULT_PROJECT})." if DEFAULT_PROJECT else " (currently unset).")
+        ),
+    )
+    p_create.add_argument("--labels", help="Comma-separated label names.")
+    p_create.add_argument(
+        "--status",
+        help=(
+            f"Initial factory state ({factory_states}); mapped to the customer's "
+            "Jira status via tracker.status_map and applied as a transition after creation."
+        ),
+    )
+    p_create.add_argument("--estimate", type=int,
+                          help="Story points (XS=1, S=2, M=3, L=5, XL=8).")
+    p_create.add_argument("--parent",
+                          help="Parent issue key (e.g. PROJ-42) to nest this issue under.")
+    p_create.add_argument("--priority", help="Jira priority name (e.g. High).")
+    p_create.set_defaults(func=cmd_create_issue)
+
+    p_comment = sub.add_parser("comment", help="Post a comment on an issue.")
+    p_comment.add_argument("--issue", required=True, help="Issue key, e.g. PROJ-123.")
+    p_comment.add_argument("--body", required=True,
+                           help="Comment body (markdown; converted to ADF).")
+    p_comment.set_defaults(func=cmd_comment)
+
+    p_update_comment = sub.add_parser(
+        "update-comment",
+        help="Update (edit) an existing comment on an issue.",
+    )
+    p_update_comment.add_argument("--issue", required=True, help="Issue key, e.g. PROJ-123.")
+    p_update_comment.add_argument(
+        "--comment-id", required=True,
+        help="ID of the comment to update (the 'id' field returned when the comment was first posted).",
+    )
+    p_update_comment.add_argument("--body", required=True,
+                                   help="New comment body (markdown; converted to ADF).")
+    p_update_comment.set_defaults(func=cmd_update_comment)
+
+    p_attach = sub.add_parser(
+        "attach-pr",
+        help="Attach a PR URL to an issue as a Jira remote link.",
+    )
+    p_attach.add_argument("--issue", required=True, help="Issue key, e.g. PROJ-123.")
+    p_attach.add_argument("--url", required=True,
+                          help="PR URL, e.g. https://github.com/org/repo/pull/42.")
+    p_attach.add_argument(
+        "--title",
+        help="Link title (default: derived from the PR URL, e.g. 'pull 42').",
+    )
+    p_attach.set_defaults(func=cmd_attach_pr)
+
+    p_labels = sub.add_parser(
+        "list-labels",
+        help="List labels in use (informational; Jira labels are free-form).",
+    )
+    p_labels.set_defaults(func=cmd_list_labels)
+
+    p_search = sub.add_parser(
+        "search-issues",
+        help="JQL keyword-search open (unresolved) issues for deduplication.",
+    )
+    p_search.add_argument("query_text",
+                          help="Key terms to search for (e.g. 'login endpoint 500').")
+    p_search.add_argument(
+        "--team",
+        default=None,
+        help=(
+            "Jira project key to scope the search. Default: tracker.default_project "
+            "from foreman/config.json."
+        ),
+    )
+    p_search.set_defaults(func=cmd_search_issues)
+
+    p_get = sub.add_parser(
+        "get-issue",
+        help="Read one issue's status, labels, estimate, priority, and people.",
+    )
+    p_get.add_argument("key", metavar="KEY", help="Issue key, e.g. PROJ-123.")
+    p_get.set_defaults(func=cmd_get_issue)
+
+    p_find_user = sub.add_parser(
+        "find-user",
+        help=(
+            "Look up Jira users by email or display name; prints accountId, "
+            "name, email, and a ready-to-use [~accountid:...] mention token."
+        ),
+    )
+    p_find_user.add_argument(
+        "query", metavar="QUERY",
+        help="Email address (best) or display name to search for.",
+    )
+    p_find_user.set_defaults(func=cmd_find_user)
+
+    p_update = sub.add_parser(
+        "update-issue",
+        help=(
+            "Set an issue's status, estimate, title, add/remove labels, "
+            "and/or set/append its description."
+        ),
+    )
+    p_update.add_argument("key", metavar="KEY", help="Issue key, e.g. PROJ-123.")
+    p_update.add_argument(
+        "--status",
+        help=(
+            f"Factory state to move the issue to ({factory_states}); mapped via "
+            "tracker.status_map and applied as a Jira transition."
+        ),
+    )
+    p_update.add_argument("--estimate", type=int,
+                          help="Story points (XS=1, S=2, M=3, L=5, XL=8).")
+    p_update.add_argument("--title", help="Replace the issue's title.")
+    p_update.add_argument(
+        "--add-label",
+        action="append",
+        metavar="NAME",
+        help="Label name to add (repeatable). Existing labels are preserved.",
+    )
+    p_update.add_argument(
+        "--remove-label",
+        action="append",
+        metavar="NAME",
+        help="Label name to remove (repeatable).",
+    )
+    p_update.add_argument(
+        "--description",
+        help="Replace the issue's full description (markdown; converted to ADF).",
+    )
+    p_update.add_argument(
+        "--append-description",
+        metavar="TEXT",
+        help=(
+            "Append TEXT to the issue's existing description (markdown), separated "
+            "by a blank line. Mutually exclusive with --description."
+        ),
+    )
+    p_update.set_defaults(func=cmd_update_issue)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

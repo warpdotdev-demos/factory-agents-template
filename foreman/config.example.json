@@ -1,0 +1,35 @@
+{
+  "_comment": "A worked example of foreman/config.json - a real single-repo setup (the linkding Django app) with generic Jira-side values. Fill in foreman/config.json itself by running scripts/factory-init (or by hand per SETUP.md); use this file only as a reference for what a completed config looks like.",
+  "tracker": {
+    "provider": "jira",
+    "browse_url": "https://yourcompany.atlassian.net",
+    "project_routing": {
+      "ENG": "All product engineering - bugs, features, and enhancements to the target repos are filed here"
+    },
+    "default_project": "ENG",
+    "status_map": {
+      "Triage": "To Do",
+      "Todo": "To Do",
+      "In Progress": "In Progress",
+      "In Review": "In Review",
+      "Done": "Done",
+      "Canceled": "Done"
+    },
+    "story_points_field": "customfield_10016",
+    "issue_type": "Task"
+  },
+  "target_repos": {
+    "warpdotdev-demos/linkding": {
+      "description": "linkding — self-hosted bookmark manager. Python/Django backend with server-rendered templates plus a small JS/Svelte frontend (bookmarks app: bookmarks, tags, archive, REST API, importers, UI). All product changes go here.",
+      "base_branch": "master",
+      "validate_command": "make lint && make test",
+      "test_guidance": "pytest on Django with SQLite (no external services); tests live in bookmarks/tests/test_*.py — add a failing-then-passing test there and run 'uv run pytest bookmarks/tests/<file> -n auto' scoped, then the full gate. Run 'make init' once to set up (uv sync + migrate + npm install).",
+      "app_start_command": "make init && uv run manage.py runserver 8000",
+      "app_url": "http://localhost:8000"
+    }
+  },
+  "default_target_repo": "warpdotdev-demos/linkding",
+  "spec_approval_required": true,
+  "self_repo": "your-org/factory-agents",
+  "self_project": "ENG"
+}

@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""github -- GitHub provider for the forge seam.
+
+This is the real code-forge provider. It exposes a unified CLI surface over the
+existing PR-related scripts and is selected by the `forge` seam when the
+provider is `github` (the default). It does not duplicate any GitHub logic; it
+wraps the scripts that already exist and remain unchanged.
+
+Subcommands:
+  build              -> scripts/factory-pr-meta build
+  find               -> scripts/factory-pr-meta find
+  verify             -> scripts/factory-pr-meta verify
+  merged             -> scripts/factory-pr-meta merged
+  bump-ci-attempt    -> scripts/factory-pr-meta bump-ci-attempt
+  bump-review-attempt -> scripts/factory-pr-meta bump-review-attempt
+  read               -> scripts/factory-pr-meta read
+  resolve-threads    -> scripts/factory-resolve-threads
+
+All flags are passed through unchanged, so the output shapes and behavior are
+identical to calling the underlying scripts directly.
+
+No third-party dependencies beyond the wrapped scripts; Python 3 stdlib only.
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_FACTORY_PR_META = os.path.join(_REPO_ROOT, "scripts", "factory-pr-meta")
+_FACTORY_RESOLVE_THREADS = os.path.join(_REPO_ROOT, "scripts", "factory-resolve-threads")
+
+
+_CMD_TO_SCRIPT = {
+    "build": _FACTORY_PR_META,
+    "find": _FACTORY_PR_META,
+    "verify": _FACTORY_PR_META,
+    "merged": _FACTORY_PR_META,
+    "bump-ci-attempt": _FACTORY_PR_META,
+    "bump-review-attempt": _FACTORY_PR_META,
+    "read": _FACTORY_PR_META,
+    "resolve-threads": _FACTORY_RESOLVE_THREADS,
+}
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="github",
+        description=(
+            "GitHub provider for the forge seam. Wraps factory-pr-meta and "
+            "factory-resolve-threads unchanged."
+        ),
+    )
+    parser.add_argument(
+        "command",
+        choices=sorted(_CMD_TO_SCRIPT.keys()),
+        help="Forge subcommand to delegate to the underlying script.",
+    )
+    parser.add_argument(
+        "remainder",
+        nargs=argparse.REMAINDER,
+        help="Arguments to pass through to the underlying script.",
+    )
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    script = _CMD_TO_SCRIPT[args.command]
+    if not os.path.isfile(script) or not os.access(script, os.X_OK):
+        die(f"underlying script not found or not executable: {script}")
+    # factory-pr-meta is subcommand-based (its subparser needs the command name
+    # as a positional); factory-resolve-threads is a flat CLI with no subcommand,
+    # so only forward the command name to the former.
+    forwarded = [args.command, *args.remainder] if script == _FACTORY_PR_META else list(args.remainder)
+    try:
+        result = subprocess.run([script, *forwarded])
+    except OSError as e:
+        die(f"failed to run underlying script {script!r}: {e}")
+    return result.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Resolve a task requester/assignee to a GitHub handle.
+
+Tracker- and chat-agnostic: it does not talk to any tracker or chat platform.
+The resolution chain is:
+
+  1. manual override map (`reviewer_overrides.json`), keyed by a stable user id
+     (a Jira `accountId` is preferred; an email also works) — consulted FIRST
+     so a hand-recorded user always resolves;
+  2. a GitHub user search by public email, when `--email` is provided;
+  3. an optional org-membership cross-check when `--repo` is given.
+
+Prints the resolved handle to stdout, or nothing (exit 0) when it cannot be
+resolved confidently. NEVER guesses a handle — callers fall back to asking the
+requester for their GitHub username in the conversation channel. Fails loudly
+(nonzero) only on hard errors from the underlying tools (gh not installed, gh
+error, etc.).
+
+The caller supplies identity it already knows. For a tracker-filed task, read
+the requester/assignee via the `scripts/tracker` CLI (get-issue) and pass their
+Jira `accountId` (or email) with --user to hit the override map, and their
+email with --email when the API exposes it. Note that Jira Cloud often hides
+user emails (profile visibility settings), so the email-search path frequently
+has nothing to go on: the override map and asking the requester in the
+conversation are the primary paths. At least one of --user / --email is
+required.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OVERRIDES_PATH = os.path.join(SCRIPT_DIR, "reviewer_overrides.json")
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def override_handle(user):
+    """Return a manually-curated GitHub handle for this user id, if any.
+
+    Reads `reviewer_overrides.json` (sibling file) — a checked-in map maintained
+    by hand for users whose handle can't be auto-resolved from a public email.
+    Consulted BEFORE the email lookup so a recorded user always resolves.
+
+    Returns None when the file is absent, malformed, or has no entry for this
+    user — a missing override is not an error; it just falls through to the
+    email-based lookup. Entries are keyed by a stable user id; each value may be
+    a bare handle string or an object with a `github` key (other keys, e.g.
+    `label`, are ignored and serve as human-readable comments).
+    """
+    if not user:
+        return None
+    try:
+        with open(OVERRIDES_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write("note: ignoring unreadable %s: %s\n" % (OVERRIDES_PATH, exc))
+        return None
+    if not isinstance(data, dict):
+        return None
+    overrides = data["overrides"] if isinstance(data.get("overrides"), dict) else data
+    entry = overrides.get(user)
+    if isinstance(entry, str):
+        handle = entry.strip()
+    elif isinstance(entry, dict):
+        handle = str(entry.get("github", "")).strip()
+    else:
+        handle = ""
+    return handle or None
+
+
+def gh(args):
+    try:
+        proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+    except FileNotFoundError:
+        die("`gh` CLI not found on PATH; install/authenticate the GitHub CLI")
+    if proc.returncode != 0:
+        die("`gh " + " ".join(args) + "` failed:\n" + (proc.stderr.strip() or "(no stderr)"))
+    return proc.stdout
+
+
+def handle_for_email(email):
+    """Best-effort GitHub handle from a public email. Empty when no match."""
+    out = gh([
+        "api", "-X", "GET", "search/users",
+        "-f", "q=%s in:email" % email,
+        "--jq", ".items[0].login // empty",
+    ])
+    return out.strip() or None
+
+
+def is_org_member(org, handle):
+    proc = subprocess.run(
+        ["gh", "api", "orgs/%s/members/%s" % (org, handle), "--silent"],
+        capture_output=True, text=True,
+    )
+    return proc.returncode == 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="factory-resolve-reviewer",
+        description="Resolve a task user to a GitHub handle via an override map or public email; prints the handle or nothing.",
+    )
+    parser.add_argument("--user", dest="user", help="Stable user id (e.g. Jira accountId, or an email) for the override map.")
+    parser.add_argument("--email", dest="email", help="Public email to search GitHub by (often hidden by Jira Cloud).")
+    parser.add_argument("--repo", help="owner/repo; OWNER is cross-checked for org membership.")
+    args = parser.parse_args(argv)
+
+    if not args.user and not args.email:
+        die("provide at least one of --user or --email")
+
+    # Manual overrides win over the email-based lookup: they exist precisely for
+    # users the email chain can't resolve (no public email), so honor them first.
+    handle = override_handle(args.user)
+    if handle:
+        print(handle)
+        return 0
+
+    if not args.email:
+        return 0  # No email to search -> cannot resolve; stay silent.
+
+    handle = handle_for_email(args.email)
+    if not handle:
+        return 0  # No public-email match -> cannot resolve; stay silent.
+
+    # Optional cross-check: confirm org membership when a repo is given. A failed
+    # check is advisory only (private membership yields false negatives), so it
+    # does not suppress an email-matched handle -- it just annotates stderr.
+    if args.repo and "/" in args.repo:
+        org = args.repo.split("/", 1)[0]
+        if not is_org_member(org, handle):
+            sys.stderr.write(
+                "note: could not confirm %s as a member of %s (private membership or non-member)\n"
+                % (handle, org)
+            )
+
+    print(handle)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

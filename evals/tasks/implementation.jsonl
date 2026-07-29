@@ -1,0 +1,2 @@
+{"id": "impl-trim-whitespace", "prompt": "Fix: item titles keep leading/trailing whitespace when saved. Trim whitespace on save and add a failing-then-passing regression test."}
+{"id": "impl-empty-state", "prompt": "Fix: the empty list view renders a blank area with no guidance. Add an empty-state message pointing users at the add action, with a regression test."}

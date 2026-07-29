@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Read/write the factory PR<->task metadata block, and check PR state.
+
+Emits FACTS as JSON to stdout, or fails loudly (nonzero exit + human-readable
+stderr). Contains no routing/judgment logic -- callers decide what to do with
+the facts. Shells out to `gh` for all GitHub access.
+
+The metadata block links a PR back to the task that spawned it. It is task-
+system agnostic: the task may come from Jira, a GitHub issue, a chat message,
+or a direct prompt. The only required identity is a stable `task_id`; a tracker
+issue key/url and other hints are optional.
+
+Subcommands:
+  build              Print the single `<!-- factory-agent: {...} -->` metadata line.
+  find               Find the PR for a task by matching task_id in PR bodies.
+  verify             Assert a PR body contains exactly one valid metadata block.
+  merged             Report a PR's merge state.
+  bump-ci-attempt    Increment the PR's ci_fix_attempts counter in place.
+  bump-review-attempt  Increment the PR's review_rework_attempts counter in place.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections import OrderedDict
+
+# A metadata block is a single HTML comment on its own line containing compact
+# JSON, e.g. `<!-- factory-agent: {"source":"factory-agent","task_id":...} -->`.
+BLOCK_RE = re.compile(r"<!--\s*factory-agent:\s*(\{.*?\})\s*-->")
+REQUIRED_KEYS = ("task_id",)
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def gh(args, input_text=None):
+    """Run a `gh` command, returning stdout. Fail loudly on any error."""
+    try:
+        proc = subprocess.run(["gh"] + args, capture_output=True, text=True, input=input_text)
+    except FileNotFoundError:
+        die("`gh` CLI not found on PATH; install/authenticate the GitHub CLI")
+    if proc.returncode != 0:
+        die("`gh " + " ".join(args) + "` failed:\n" + (proc.stderr.strip() or "(no stderr)"))
+    return proc.stdout
+
+
+def valid_blocks(body):
+    """Return the list of well-formed factory-agent metadata dicts in `body`.
+
+    A block is valid only when it parses as JSON, has source==factory-agent,
+    and carries all required keys with non-empty values.
+    """
+    blocks = []
+    for m in BLOCK_RE.finditer(body or ""):
+        try:
+            data = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("source") != "factory-agent":
+            continue
+        if all(data.get(k) for k in REQUIRED_KEYS):
+            blocks.append(data)
+    return blocks
+
+
+def pr_body(pr, repo):
+    return json.loads(gh(["pr", "view", str(pr), "--repo", repo, "--json", "body"])).get("body") or ""
+
+
+def cmd_build(args):
+    meta = OrderedDict()
+    meta["source"] = "factory-agent"
+    meta["task_id"] = args.task_id
+    if args.task_source:
+        meta["task_source"] = args.task_source
+    if args.task_url:
+        meta["task_url"] = args.task_url
+    if args.tracker_issue_id:
+        meta["tracker_issue_id"] = args.tracker_issue_id
+    if args.oz_run_id:
+        meta["oz_run_id"] = args.oz_run_id
+    if args.repo:
+        meta["repo"] = args.repo
+    if args.pr_url:
+        meta["pr_url"] = args.pr_url
+    if args.ci_fix_attempts is not None:
+        meta["ci_fix_attempts"] = args.ci_fix_attempts
+    if args.review_rework_attempts is not None:
+        meta["review_rework_attempts"] = args.review_rework_attempts
+    print("<!-- factory-agent: " + json.dumps(meta, separators=(",", ":")) + " -->")
+    return 0
+
+
+def _attempt_count(data, key="ci_fix_attempts"):
+    """Return the non-negative integer counter stored under `key` (0 if absent)."""
+    try:
+        count = int(data.get(key))
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
+
+
+def _candidate_prs(repo, task_id):
+    """Gather PRs that might carry this task's metadata block.
+
+    Tries a targeted body search first (cheap), then falls back to scanning all
+    factory-branch PRs so a task_id that the GitHub search tokenizer mangles is
+    still found.
+    """
+    seen = {}
+    fields = "number,url,state,headRefName,body,reviewRequests"
+    for search in (f"{task_id} in:body", "head:factory/"):
+        raw = gh([
+            "pr", "list", "--repo", repo, "--state", "all",
+            "--search", search, "--json", fields, "--limit", "100",
+        ])
+        for pr in json.loads(raw):
+            seen[pr["number"]] = pr
+    return list(seen.values())
+
+
+def _reviewers(pr):
+    """Flatten gh reviewRequests into a list of handles (user login or team slug)."""
+    handles = []
+    for r in pr.get("reviewRequests") or []:
+        handle = r.get("login") or r.get("slug") or r.get("name")
+        if handle:
+            handles.append(handle)
+    return handles
+
+
+def cmd_find(args):
+    for pr in _candidate_prs(args.repo, args.task_id):
+        for block in valid_blocks(pr.get("body")):
+            if block.get("task_id") == args.task_id:
+                out = OrderedDict()
+                out["number"] = pr["number"]
+                out["url"] = pr["url"]
+                out["state"] = pr["state"]
+                out["headRefName"] = pr["headRefName"]
+                out["merged"] = pr["state"] == "MERGED"
+                out["reviewers"] = _reviewers(pr)
+                out["ci_fix_attempts"] = _attempt_count(block, "ci_fix_attempts")
+                out["review_rework_attempts"] = _attempt_count(block, "review_rework_attempts")
+                print(json.dumps(out))
+                return 0
+    # No PR for this task: print nothing, exit 0.
+    return 0
+
+
+def cmd_verify(args):
+    count = len(valid_blocks(pr_body(args.pr, args.repo)))
+    if count == 1:
+        print(json.dumps({"valid": True, "count": 1}))
+        return 0
+    die("expected exactly one valid factory-agent metadata block, found %d" % count)
+
+
+def _bump_counter(pr, repo, key):
+    """Increment the integer counter `key` on the PR's single metadata block.
+
+    An agent calls this once per attempt; the resulting count is the durable
+    source of truth for how many automated attempts of that kind have happened
+    (CI fixes, or review-driven rework cycles). Returns the new count.
+    """
+    body = pr_body(pr, repo)
+    target = None
+    for m in BLOCK_RE.finditer(body):
+        try:
+            data = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or data.get("source") != "factory-agent":
+            continue
+        if not all(data.get(k) for k in REQUIRED_KEYS):
+            continue
+        if target is not None:
+            die("expected exactly one valid factory-agent metadata block, found multiple")
+        target = (m, data)
+    if target is None:
+        die("no valid factory-agent metadata block to update")
+
+    match, data = target
+    data[key] = _attempt_count(data, key) + 1
+    new_block = "<!-- factory-agent: " + json.dumps(data, separators=(",", ":")) + " -->"
+    new_body = body[: match.start()] + new_block + body[match.end():]
+    gh(["pr", "edit", str(pr), "--repo", repo, "--body-file", "-"], input_text=new_body)
+    return data[key]
+
+
+def cmd_bump_ci_attempt(args):
+    """Increment ci_fix_attempts on the PR's single metadata block, in place.
+
+    The agent calls this once after pushing a CI fix; the resulting count is the
+    durable source of truth for how many automated fixes have been attempted.
+    """
+    count = _bump_counter(args.pr, args.repo, "ci_fix_attempts")
+    print(json.dumps({"ci_fix_attempts": count}))
+    return 0
+
+
+def cmd_bump_review_attempt(args):
+    """Increment review_rework_attempts on the PR's single metadata block.
+
+    The implementation agent calls this once each time it re-enters rework after
+    a code-review rejection; the resulting count is the durable source of truth
+    for how many review-driven rework cycles have happened, so the foreman can
+    cap the auto-rework loop.
+    """
+    count = _bump_counter(args.pr, args.repo, "review_rework_attempts")
+    print(json.dumps({"review_rework_attempts": count}))
+    return 0
+
+
+def cmd_merged(args):
+    data = json.loads(gh([
+        "pr", "view", str(args.pr), "--repo", args.repo,
+        "--json", "state,mergedAt,mergeCommit",
+    ]))
+    state = data.get("state")
+    merged_at = data.get("mergedAt")
+    out = OrderedDict()
+    out["state"] = state
+    out["mergedAt"] = merged_at
+    out["merged"] = state == "MERGED" and bool(merged_at)
+    print(json.dumps(out))
+    return 0
+
+
+def cmd_read(args):
+    """Print the PR's factory-agent metadata block as JSON (empty object if none).
+
+    Reads the PR body via gh (repo inferred from a PR URL when --repo is omitted)
+    and prints the first valid metadata block, so callers can deterministically
+    pull fields like tracker_issue_id / task_url. Prints {} (exit 0) when the PR
+    has no valid block.
+    """
+    view = ["pr", "view", str(args.pr), "--json", "body"]
+    if args.repo:
+        view += ["--repo", args.repo]
+    body = json.loads(gh(view)).get("body") or ""
+    blocks = valid_blocks(body)
+    print(json.dumps(blocks[0] if blocks else {}))
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="factory-pr-meta",
+        description="Read/write the factory PR<->task metadata block and check PR state.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_build = sub.add_parser("build", help="Print the single metadata-block line.")
+    p_build.add_argument("--task-id", dest="task_id", required=True, help="Stable task identifier (e.g. Jira issue key, GitHub issue number).")
+    p_build.add_argument("--task-source", dest="task_source", help="Where the task came from (e.g. jira, github, prompt).")
+    p_build.add_argument("--task-url", dest="task_url", help="URL of the task (e.g. Jira issue URL).")
+    p_build.add_argument("--tracker-issue-id", dest="tracker_issue_id", help="Tracker issue key (e.g. a Jira issue key), when the task is tracked.")
+    p_build.add_argument("--oz-run-id", dest="oz_run_id", help="Oz run id (include when available).")
+    p_build.add_argument("--repo", help="owner/repo disambiguation hint.")
+    p_build.add_argument("--pr-url", dest="pr_url", help="PR URL disambiguation hint.")
+    p_build.add_argument(
+        "--ci-fix-attempts",
+        dest="ci_fix_attempts",
+        type=int,
+        help="Automated CI-fix attempt count (usually managed via bump-ci-attempt).",
+    )
+    p_build.add_argument(
+        "--review-rework-attempts",
+        dest="review_rework_attempts",
+        type=int,
+        help="Review-driven rework attempt count (usually managed via bump-review-attempt).",
+    )
+    p_build.set_defaults(func=cmd_build)
+
+    p_find = sub.add_parser("find", help="Find the task's PR via its metadata block.")
+    p_find.add_argument("--task-id", dest="task_id", required=True, help="Task identifier to match.")
+    p_find.add_argument("--repo", required=True, help="owner/repo to search.")
+    p_find.set_defaults(func=cmd_find)
+
+    p_verify = sub.add_parser("verify", help="Assert exactly one valid metadata block in a PR body.")
+    p_verify.add_argument("--pr", required=True, help="PR number.")
+    p_verify.add_argument("--repo", required=True, help="owner/repo.")
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_merged = sub.add_parser("merged", help="Report a PR's merge state.")
+    p_merged.add_argument("--pr", required=True, help="PR number.")
+    p_merged.add_argument("--repo", required=True, help="owner/repo.")
+    p_merged.set_defaults(func=cmd_merged)
+
+    p_read = sub.add_parser("read", help="Print a PR's factory-agent metadata block as JSON.")
+    p_read.add_argument("--pr", required=True, help="PR number or URL. A URL lets gh infer the repo.")
+    p_read.add_argument("--repo", help="owner/repo (required when --pr is a number).")
+    p_read.set_defaults(func=cmd_read)
+
+    p_bump = sub.add_parser("bump-ci-attempt", help="Increment the PR's ci_fix_attempts counter.")
+    p_bump.add_argument("--pr", required=True, help="PR number.")
+    p_bump.add_argument("--repo", required=True, help="owner/repo.")
+    p_bump.set_defaults(func=cmd_bump_ci_attempt)
+
+    p_bump_review = sub.add_parser("bump-review-attempt", help="Increment the PR's review_rework_attempts counter.")
+    p_bump_review.add_argument("--pr", required=True, help="PR number.")
+    p_bump_review.add_argument("--repo", required=True, help="owner/repo.")
+    p_bump_review.set_defaults(func=cmd_bump_review_attempt)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

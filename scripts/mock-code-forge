@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""mock-code-forge -- in-memory mock code-forge provider for the factory loop (evals only).
+
+A drop-in stand-in for `scripts/github` used **exclusively by the eval harness**
+so an eval run can exercise the full factory pipeline without touching real
+GitHub: no network, no `gh`, and no real PRs created. Select it via the forge
+seam with `--provider mock-code-forge` or `FACTORY_FORGE_PROVIDER=mock-code-forge`
+(see `scripts/forge`).
+
+It exposes the **same subcommands, flags, and JSON output shapes** as the GitHub
+provider, so every caller (agent skills + helper scripts) works unchanged:
+  build              Build and store a PR metadata block.
+  find               Find a PR for a task by its metadata block.
+  verify             Assert a PR body contains exactly one valid metadata block.
+  merged             Report a PR's merge state.
+  bump-ci-attempt    Increment the PR's ci_fix_attempts counter.
+  bump-review-attempt  Increment the PR's review_rework_attempts counter.
+  read               Read a PR's factory-agent metadata block.
+  resolve-threads    Resolve specific review threads after a rework.
+
+Behavior differences from the GitHub provider (by design):
+  * It **always succeeds** for the operations agents perform. Unknown PRs and
+    missing threads are silently accepted.
+  * State is kept in a **local JSON store** on disk so separate CLI invocations
+    within the same eval environment share the same mock "service". The store
+    lives at $FACTORY_MOCK_FORGE_STORE, else a stable path under the system temp
+    dir. Delete it to reset the mock.
+  * `read`, `bump-ci-attempt`, and `bump-review-attempt` operate on the most
+    recently stored record and ignore `--pr`, whereas `find` keys off `--task-id`.
+    This matches the "always succeeds" mock design for single-PR eval runs.
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+from collections import OrderedDict
+
+BASE_URL = "https://mock.forge.local"
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# The "in-memory" store, persisted to a local JSON file so it survives across
+# the separate CLI invocations that make up one eval run.
+# ---------------------------------------------------------------------------
+
+def _store_path():
+    override = os.environ.get("FACTORY_MOCK_FORGE_STORE")
+    if override:
+        return override
+    return os.path.join(tempfile.gettempdir(), "factory-mock-forge.json")
+
+
+def _empty_store():
+    return {"records": {}}
+
+
+def _load_store():
+    path = _store_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return _empty_store()
+    if not isinstance(data, dict):
+        return _empty_store()
+    data.setdefault("records", {})
+    return data
+
+
+def _save_store(store):
+    path = _store_path()
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".mock-forge-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _current_record(store):
+    """Return the most recently stored record, or None if the store is empty."""
+    records = store.get("records") or {}
+    if not records:
+        return None
+    return list(records.values())[-1]
+
+
+# ---------------------------------------------------------------------------
+# Subcommands (output shapes mirror scripts/github -> scripts/factory-pr-meta)
+# ---------------------------------------------------------------------------
+
+def _metadata_block(meta):
+    return "<!-- factory-agent: " + json.dumps(meta, separators=(",", ":")) + " -->"
+
+
+def cmd_build(args):
+    store = _load_store()
+    meta = OrderedDict()
+    meta["source"] = "factory-agent"
+    meta["task_id"] = args.task_id
+    if args.task_source:
+        meta["task_source"] = args.task_source
+    if args.task_url:
+        meta["task_url"] = args.task_url
+    if args.tracker_issue_id:
+        meta["tracker_issue_id"] = args.tracker_issue_id
+    if args.oz_run_id:
+        meta["oz_run_id"] = args.oz_run_id
+    if args.repo:
+        meta["repo"] = args.repo
+    if args.pr_url:
+        meta["pr_url"] = args.pr_url
+    if args.ci_fix_attempts is not None:
+        meta["ci_fix_attempts"] = args.ci_fix_attempts
+    if args.review_rework_attempts is not None:
+        meta["review_rework_attempts"] = args.review_rework_attempts
+
+    record = {
+        "meta": meta,
+        "ci_fix_attempts": args.ci_fix_attempts or 0,
+        "review_rework_attempts": args.review_rework_attempts or 0,
+    }
+    store["records"][args.task_id] = record
+    _save_store(store)
+
+    print(_metadata_block(meta))
+    return 0
+
+
+def cmd_find(args):
+    store = _load_store()
+    record = store.get("records", {}).get(args.task_id)
+    if record is None:
+        return 0
+
+    print(json.dumps({
+        "number": 1,
+        "url": record["meta"].get("pr_url") or f"{BASE_URL}/pr/1",
+        "state": "OPEN",
+        "headRefName": "factory/mock",
+        "merged": False,
+        "reviewers": [],
+        "ci_fix_attempts": record["ci_fix_attempts"],
+        "review_rework_attempts": record["review_rework_attempts"],
+    }))
+    return 0
+
+
+def cmd_verify(args):
+    print(json.dumps({"valid": True, "count": 1}))
+    return 0
+
+
+def cmd_merged(args):
+    print(json.dumps({"state": "OPEN", "mergedAt": None, "merged": False}))
+    return 0
+
+
+def cmd_bump_ci_attempt(args):
+    store = _load_store()
+    record = _current_record(store)
+    if record is None:
+        print(json.dumps({"ci_fix_attempts": 1}))
+        return 0
+    record["ci_fix_attempts"] += 1
+    record["meta"]["ci_fix_attempts"] = record["ci_fix_attempts"]
+    _save_store(store)
+    print(json.dumps({"ci_fix_attempts": record["ci_fix_attempts"]}))
+    return 0
+
+
+def cmd_bump_review_attempt(args):
+    store = _load_store()
+    record = _current_record(store)
+    if record is None:
+        print(json.dumps({"review_rework_attempts": 1}))
+        return 0
+    record["review_rework_attempts"] += 1
+    record["meta"]["review_rework_attempts"] = record["review_rework_attempts"]
+    _save_store(store)
+    print(json.dumps({"review_rework_attempts": record["review_rework_attempts"]}))
+    return 0
+
+
+def cmd_read(args):
+    store = _load_store()
+    record = _current_record(store)
+    print(json.dumps(record["meta"] if record else {}))
+    return 0
+
+
+def cmd_resolve_threads(args):
+    # Accept the same arguments as factory-resolve-threads but always succeed.
+    print(json.dumps({"resolved": 0}))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser (mirrors the union of factory-pr-meta + factory-resolve-threads)
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="mock-code-forge",
+        description=(
+            "In-memory mock code-forge provider (evals only): build, find, verify, "
+            "merged, bump-ci-attempt, bump-review-attempt, read, resolve-threads. "
+            "Mirrors the GitHub provider's interface and always succeeds."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_build = sub.add_parser("build", help="Build and store a metadata block.")
+    p_build.add_argument("--task-id", dest="task_id", required=True, help="Stable task identifier.")
+    p_build.add_argument("--task-source", dest="task_source", help="Where the task came from.")
+    p_build.add_argument("--task-url", dest="task_url", help="URL of the task.")
+    p_build.add_argument("--tracker-issue-id", dest="tracker_issue_id", help="Tracker issue key.")
+    p_build.add_argument("--oz-run-id", dest="oz_run_id", help="Oz run id.")
+    p_build.add_argument("--repo", help="owner/repo disambiguation hint.")
+    p_build.add_argument("--pr-url", dest="pr_url", help="PR URL disambiguation hint.")
+    p_build.add_argument("--ci-fix-attempts", dest="ci_fix_attempts", type=int, help="CI-fix attempt count.")
+    p_build.add_argument(
+        "--review-rework-attempts",
+        dest="review_rework_attempts",
+        type=int,
+        help="Review-driven rework attempt count.",
+    )
+    p_build.set_defaults(func=cmd_build)
+
+    p_find = sub.add_parser("find", help="Find the task's PR via its metadata block.")
+    p_find.add_argument("--task-id", dest="task_id", required=True, help="Task identifier to match.")
+    p_find.add_argument("--repo", required=True, help="owner/repo to search.")
+    p_find.set_defaults(func=cmd_find)
+
+    p_verify = sub.add_parser("verify", help="Assert exactly one valid metadata block.")
+    p_verify.add_argument("--pr", required=True, help="PR number.")
+    p_verify.add_argument("--repo", required=True, help="owner/repo.")
+    p_verify.set_defaults(func=cmd_verify)
+
+    p_merged = sub.add_parser("merged", help="Report a PR's merge state.")
+    p_merged.add_argument("--pr", required=True, help="PR number.")
+    p_merged.add_argument("--repo", required=True, help="owner/repo.")
+    p_merged.set_defaults(func=cmd_merged)
+
+    p_bump = sub.add_parser("bump-ci-attempt", help="Increment the PR's ci_fix_attempts counter.")
+    p_bump.add_argument("--pr", required=True, help="PR number.")
+    p_bump.add_argument("--repo", required=True, help="owner/repo.")
+    p_bump.set_defaults(func=cmd_bump_ci_attempt)
+
+    p_bump_review = sub.add_parser("bump-review-attempt", help="Increment the PR's review_rework_attempts counter.")
+    p_bump_review.add_argument("--pr", required=True, help="PR number.")
+    p_bump_review.add_argument("--repo", required=True, help="owner/repo.")
+    p_bump_review.set_defaults(func=cmd_bump_review_attempt)
+
+    p_read = sub.add_parser("read", help="Read a PR's factory-agent metadata block.")
+    p_read.add_argument("--pr", required=True, help="PR number or URL.")
+    p_read.add_argument("--repo", help="owner/repo (required when --pr is a number).")
+    p_read.set_defaults(func=cmd_read)
+
+    p_resolve = sub.add_parser(
+        "resolve-threads",
+        help="Resolve specific review threads on a PR after a rework.",
+    )
+    p_resolve.add_argument("--repo", required=True, help="owner/repo.")
+    p_resolve.add_argument("--pr", required=True, type=int, help="Pull request number.")
+    p_resolve.add_argument("--thread-ids", required=True, help="Comma-separated thread IDs to resolve.")
+    p_resolve.add_argument("--rework-cycle", required=True, type=int, help="Rework cycle number.")
+    p_resolve.add_argument("--commit-sha", help="SHA of the rework commit.")
+    p_resolve.add_argument("--commit-url", help="Full URL of the rework commit.")
+    p_resolve.set_defaults(func=cmd_resolve_threads)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
