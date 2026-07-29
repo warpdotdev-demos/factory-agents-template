@@ -47,11 +47,73 @@ git remote add template https://github.com/warpdotdev-demos/factory-agents-templ
 git fetch template && git merge template/main
 ```
 
-## 2. Create a Jira API token and store the Oz secrets
+## 2. Set up the Jira service account, its API token, and the Oz secrets
 
-Create an API token for the (service) account the factory should act as:
-https://id.atlassian.com/manage-profile/security/api-tokens. A dedicated
-service account is recommended so factory activity is clearly attributed.
+The factory acts in Jira as a real user account: every ticket it creates,
+comment it posts, status transition, estimate, and PR link is attributed to
+the account behind the API token. Use a **dedicated service account** rather
+than a personal one — factory activity stays clearly attributed in ticket
+history and audit logs, the token survives employee offboarding, and access
+can be scoped and revoked without touching anyone's personal account.
+
+### 2a. Create (or reuse) the service account
+
+Two ways to get one:
+
+- **Atlassian service account (recommended).** An organization admin creates
+  it at admin.atlassian.com → **Directory → Service accounts** → *Create
+  service account* (e.g. `factory-agent`); the email is auto-generated. Up to
+  five service accounts are free per organization. Note that service
+  accounts can only create **scoped** API tokens, which authenticate at the
+  cloud-ID gateway rather than the site URL — see the scoped-token note at
+  the end of this step.
+- **A regular Atlassian account on a dedicated mailbox** (e.g.
+  `factory-agent@yourcompany.com`). Use this when an org-level service
+  account isn't available; it also supports plain unscoped API tokens that
+  authenticate directly against the site URL.
+
+Whichever you pick, the account needs:
+
+- **Product access to Jira** on your site (grant the Jira app with the User
+  role; it consumes a licensed seat, and project permissions alone are not
+  enough without app access).
+- **Project permissions in every routed project** — every key in
+  `tracker.project_routing` plus `self_project`: *Browse Projects*, *Create
+  Issues*, *Edit Issues*, *Add Comments*, *Transition Issues*, and *Link
+  Issues* (the factory attaches PRs as remote links). Adding the account to
+  each project's default member/developer role typically covers all of
+  these; verify with Jira's Permission Helper. A dedicated group (e.g.
+  `factory-agent-svc`) that carries these permissions keeps auditing and
+  offboarding simple.
+
+### 2b. Create the API token with the right scopes
+
+Create the token as the service account: admin.atlassian.com → Directory →
+Service accounts → your account → **Create credentials → API token**. (For a
+regular dedicated account, sign in as it and create the token at
+https://id.atlassian.com/manage-profile/security/api-tokens — with or without
+scopes.)
+
+When the token is **scoped** (mandatory for service accounts, recommended
+otherwise), filter the scope picker to app **Jira**, scope type **Classic**,
+and grant exactly these three scopes:
+
+- `read:jira-work` — read and search issues, projects, workflow statuses,
+  and fields (get-issue, search-issues, list-labels, and factory-init's
+  status / story-points autodiscovery).
+- `write:jira-work` — create issues, post comments, transition status, edit
+  labels and estimates, and attach PR remote links.
+- `read:jira-user` — look up users by name or email (find-user, @-mention
+  and reviewer resolution).
+
+Prefer these classic scopes over their granular equivalents: Atlassian
+enforces an endpoint's granular scope list all-or-nothing, so a partial
+granular set fails with `Unauthorized; scope does not match`. Scopes cap what
+the token may do **in addition to** the account's project permissions — an
+action must be allowed by both. Tokens expire (365 days maximum, 1 year by
+default) and scopes can't be edited after creation — calendar the rotation.
+
+### 2c. Store the Oz secrets
 
 Store the Jira credentials as Oz team secrets so cloud runs can read them as
 environment variables (each command prompts for the value; the token is never
@@ -65,9 +127,9 @@ oz secret create --team JIRA_BASE_URL    # e.g. https://<your-company>.atlassian
 
 For local testing, export the same three variables in your shell.
 
-**Scoped API tokens.** Some Atlassian tokens (notably service-account scoped
-tokens) are rejected at the site URL (401) and only authenticate at the
-cloud-ID gateway. If `GET $JIRA_BASE_URL/rest/api/3/myself` returns 401 with a
+**Scoped API tokens authenticate only at the cloud-ID gateway.** A scoped
+token — which includes every service-account token — is rejected at the site
+URL (401). If `GET $JIRA_BASE_URL/rest/api/3/myself` returns 401 with a
 token you know is valid, find your cloudId
 (`curl -s https://<your-company>.atlassian.net/_edge/tenant_info`), set
 `JIRA_BASE_URL=https://api.atlassian.com/ex/jira/<cloudId>`, and set
