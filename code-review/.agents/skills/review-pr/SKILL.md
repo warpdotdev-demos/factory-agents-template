@@ -230,14 +230,8 @@ reviewed this head SHA (per conversation history), don't repeat it.
 
 ## Step 7 — Notify the task
 
-On a **Slack-door** task, post a notification on the task's record (tag the
-author) with the PR link,
-verdict, one-line summary, and review link, per `factory-tracker-ops` — plain
-markdown, each item on its own line, and never ask the reader to reply to the
-comment (it is a service-account comment; replies are not routed to the
-factory). On a **Jira-door** task post no such comment — the same content
-travels in the completion report to the foreman, whose step result reaches
-the ticket via the Warp app (see `factory-review` Step 3). Your
+Post a notification on the task's record (tag the author) with the PR link,
+verdict, one-line summary, and review link, per `factory-tracker-ops`. Your
 verdict is the ticket's accepted/rejected review outcome and drives the
 **terminal gate label** that `factory-review` Step 3 applies while setting status
 **In Review**: an **accepted** verdict → `review-done`; a **rejected** verdict

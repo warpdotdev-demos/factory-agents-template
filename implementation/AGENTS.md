@@ -22,9 +22,9 @@ drain your inbox for a `{"task_id",...}` message from the foreman (parallel-
 dispatch path). If still none, post a brief error in the conversation and end
 (see `factory-implement` Step 0). Any message for the conversation channel —
 errors, clarifying questions, or other gating asks — is delivered per **Who can
-post where** in `factory-tracker-ops`: via a `RELAY:` message to the foreman
-on either door (you cannot post to the conversation yourself, and a
-service-account ticket comment's replies are not routed to the factory).
+post where** in `factory-tracker-ops`: via a `RELAY:` message to the foreman on
+a Slack-door task (you cannot post to the Slack thread yourself), or a Jira
+comment you post on a Jira-door task.
 
 **Gate first.** Before doing primary implementation work, confirm the linked
 ticket carries `spec-done` or `blocked` (see `factory-tracker-ops`

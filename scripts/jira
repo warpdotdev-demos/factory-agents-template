@@ -334,11 +334,6 @@ def markdown_to_adf(markdown):
     ([text](url), <url> autolinks, and bare http(s):// URLs), bullet and
     numbered lists, and fenced code blocks. Anything else is treated as
     paragraph text. Pure function; safe to unit-test offline.
-
-    Single newlines between adjacent paragraph lines are preserved as ADF
-    hardBreak nodes (matching how people expect a Jira comment to render),
-    so multi-line status updates don't collapse into one run-on paragraph.
-    Blank lines still split paragraphs.
     """
     lines = (markdown or "").replace("\r\n", "\n").split("\n")
     content = []
@@ -346,16 +341,9 @@ def markdown_to_adf(markdown):
 
     def flush_para():
         if para:
-            nodes = []
-            for line in para:
-                line_nodes = _inline_nodes(line)
-                if not line_nodes:
-                    continue
-                if nodes:
-                    nodes.append({"type": "hardBreak"})
-                nodes.extend(line_nodes)
-            if nodes:
-                content.append({"type": "paragraph", "content": nodes})
+            text = " ".join(para).strip()
+            if text:
+                content.append(_paragraph(text))
             del para[:]
 
     i = 0

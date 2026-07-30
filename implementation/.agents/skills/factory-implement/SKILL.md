@@ -178,9 +178,9 @@ Gather everything you need before writing code:
   genuine ambiguity you cannot resolve from the ticket or the codebase, **note
   the blocking issue on the ticket** (and surface the specific question to the
   requester in the task's conversation channel, written for a stranger — via a
-  `RELAY:` message to the foreman on either door, since you cannot post to
-  the conversation yourself,
-  per **Who can post where** in `factory-tracker-ops`), set the ticket's
+  `RELAY:` message to the foreman on a Slack-door task since you cannot post
+  to the Slack thread yourself, or a Jira comment you post on a Jira-door
+  task, per **Who can post where** in `factory-tracker-ops`), set the ticket's
   terminal status to **incomplete** (see Step 7), and **stop** rather than
   guessing.
 
@@ -356,8 +356,8 @@ gh pr edit <pr> --repo <task's target repo> --add-reviewer <handle>
 If it resolves nothing (it never guesses), ask the requester for their GitHub
 username **in the task's conversation channel** (per the door-dependent doctrine
 and **Who can post where** in `factory-tracker-ops`, written for a stranger —
-via a `RELAY:` message to the foreman on either door), then end your turn and
-assign on resume.
+via a `RELAY:` message to the foreman on a Slack-door task, or a Jira comment
+you post on a Jira-door task), then end your turn and assign on resume.
 
 **Don't duplicate the assignment on the shared spec PR.** When you reused the
 spec phase's PR (Step 1), the spec phase already assigned the requester at
@@ -386,15 +386,10 @@ the pipeline gate label.
 
 **Set the ticket's implementation completion signals — complete or incomplete:**
 - **Complete** — the change is implemented and one or more PRs are open and
-  linked. Record the PR link(s) on the ticket (attach-pr on both doors; the
-  PR-link comment on a Slack-door task only — see the completion report
-  contract in `factory-tracker-ops`), set/keep the lifecycle status
+  linked. Record the PR link(s) on the ticket, set/keep the lifecycle status
   **In Progress**, apply `impl-done`, and **remove** `spec-done` and `blocked`
   (if present). Post a substantive PR-ready notification (full detail, not terse)
-  tagging the requester: the PR link(s), what changed, and how it was verified —
-  as a record comment on a Slack-door task; on a Jira-door task put this
-  detail in your completion report to the foreman instead (its step result,
-  mirrored by the Warp app, carries it to the ticket).
+  tagging the requester: the PR link(s), what changed, and how it was verified.
   Complete all label/status/artifact/report requirements:
   - **If this is a `blocked` rework re-entry**: before applying the label,
     resolve the PR review threads you addressed in this cycle (see
@@ -429,10 +424,7 @@ the pipeline gate label.
      the durable completion record.
 - **Incomplete** — you could not finish (underspecified/ambiguous spec, an
   unresolved reviewer, an unavailable toolchain, or another blocker). Note the
-  blocking issue on the ticket tagging the requester (a record comment on a
-  Slack-door task; on a Jira-door task carry it in your blocker report to the
-  foreman, whose response reaches the ticket via the Warp app), report the
-  blocker to the
+  blocking issue on the ticket tagging the requester, report the blocker to the
   foreman, keep the ticket out of review (leave `spec-done` so it remains
   implementation-owned; do not add `blocked`, which is reserved for review-rework
   state), and leave the lifecycle status at **In Progress**. Do not claim

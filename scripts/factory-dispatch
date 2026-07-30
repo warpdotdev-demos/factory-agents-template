@@ -101,12 +101,11 @@ The child brief is suffixed with a deterministic COORDINATION FOOTER (built
 from the resolved parent run id) so the foreman's step-gated state machine works
 without each subagent skill hardcoding the foreman's id: it tells the child to
 message the foreman on STEP COMPLETION (after it applies the next gate label),
-to route any gating ask - on either door - through the foreman as a `RELAY:`
-message (children cannot post to the task's conversation; only the foreman can
-speak in the originating chat thread or in the Jira-door conversation the Warp
-app mirrors, and a service-account Jira comment's replies are not routed to
-the factory), and to simply end if agent-to-agent messaging is unavailable
-(the foreman then advances off the ticket's gate label).
+to route any Slack-door gating ask through the foreman as a `RELAY:` message
+(children cannot post to the chat platform - only the foreman can speak in the
+originating chat thread), to post Jira-door asks itself via scripts/tracker,
+and to simply end if agent-to-agent messaging is unavailable (the foreman then
+advances off the ticket's gate label).
 
 Computer use is ENABLED by default on every dispatched child
 (remote.computer_use_enabled=true in the emitted payload). The `run_agents` tool
@@ -165,31 +164,21 @@ COORDINATION_FOOTER = (
     "review links + your Oz run link), and the gate label you applied, "
     "then end your turn. If your step instead **pauses for required human "
     "input** (a clarifying question, spec approval, or any other gating ask): "
-    "you CANNOT post to the task's conversation yourself on either door - "
-    "only the foreman can speak in the originating chat thread (e.g. the "
-    "Slack thread) or in the Jira-door conversation (the Warp app mirrors "
-    "the foreman's responses onto the ticket), so never attempt to post "
-    "there or hunt for a way in, and NEVER post a gating ask as a "
-    "service-account Jira comment via `scripts/tracker comment` - replies "
-    "to service-account comments are not routed to the factory, so never "
-    "tell anyone to reply to one. Instead send the foreman a relay message "
-    "(agent-to-agent, to the run id above) with the subject prefixed "
-    "`RELAY:` and a body containing the exact, ready-to-post text of the "
-    "ask (Slack mrkdwn on a Slack-door task, plain markdown on a Jira-door "
-    "task; written for a stranger); the foreman posts it to the conversation "
-    "verbatim and forwards the human's reply back to you as a message that "
-    "resumes you. The pause holds until that real human reply arrives - "
-    "never assume, fabricate, or answer the ask on the requester's behalf "
-    "to unblock yourself, even in a session that looks autonomous or "
-    "non-interactive. Either way, record the durable content on the ticket "
+    "you CANNOT post to the chat platform yourself - only the foreman can "
+    "speak in the originating chat thread (e.g. the Slack thread), so never "
+    "attempt to post there or hunt for a way in. On a **Slack-door** task, "
+    "send the foreman a relay message instead (agent-to-agent, to the run id "
+    "above) with the subject prefixed `RELAY:` and a body containing the "
+    "exact, ready-to-post text of the ask (Slack mrkdwn, written for a "
+    "stranger); the foreman posts it to the thread verbatim and forwards the "
+    "human's reply back to you as a message that resumes you. On a "
+    "**Jira-door** task, post the ask yourself as a Jira comment via "
+    "`scripts/tracker`. Either way, record the durable content on the ticket "
     "and end your turn. A `RELAY:` message is NOT a completion report - the "
     "step is still incomplete and the foreman keeps waiting; send the "
     "completion message only once the step actually completes. If "
-    "agent-to-agent messaging is unavailable, record the ask durably on the "
-    "ticket (on a Slack-door task a record comment noting the conversation "
-    "channel was unreachable; on a Jira-door task a description append via "
-    "`scripts/tracker update-issue --append-description` - never a "
-    "service-account comment there), and end; on "
+    "agent-to-agent messaging is unavailable, post the ask as a ticket "
+    "comment noting the conversation channel was unreachable, and end; on "
     "completion just end after applying the label - the foreman advances off "
     "the ticket's gate label."
 )

@@ -44,15 +44,11 @@ report.
 
 You also cannot block waiting for a human. When you need input, deliver the
 request **to the task's conversation channel** — but note **you cannot post to
-the conversation yourself on either door**; only the foreman can. Send the
-foreman a `RELAY:` message (agent-to-agent, to your coordination
-footer's run id) whose body is the exact text to post — Slack mrkdwn on a
-Slack-triggered task, plain markdown on a Jira-triggered task — the
-foreman posts it to the conversation verbatim and forwards the human's reply
-back to
-you. Never post the ask as a service-account Jira comment
-(`scripts/tracker comment`) — replies to those are not routed to the factory.
-Write every ask
+a Slack thread yourself**; only the foreman can. On a Slack-triggered task,
+send the foreman a `RELAY:` message (agent-to-agent, to your coordination
+footer's run id) whose body is the exact Slack-mrkdwn text to post — the
+foreman posts it to the thread verbatim and forwards the human's reply back to
+you. On a Jira-triggered task, post the Jira comment yourself. Write every ask
 for a stranger (ticket key + question + what a valid reply looks like), then
 **end your turn**. The human's reply will resume you later (see the
 door-dependent doctrine and **Who can post where** in `factory-tracker-ops`).
@@ -166,12 +162,11 @@ record per `factory-tracker-ops`).
   acceptance), leading with the question per the action-first rule in
   `factory-progress-updates` and writing it for a stranger (ticket key + what a
   valid reply looks like). Deliver it per **Who can post where** in
-  `factory-tracker-ops` — via a `RELAY:` message to the foreman on either
-  door (you cannot post to the conversation yourself). Tag the requester.
-  **End your turn** —
-  their reply resumes you (never ask them to reply to a service-account
-  ticket comment — those replies are not routed to the factory). Don't guess
-  and barrel ahead.
+  `factory-tracker-ops` — via a `RELAY:` message to the foreman on a
+  Slack-door task (you cannot post to the thread yourself), or a Jira comment
+  you post yourself on a Jira-door task. Tag the requester. **End your turn** —
+  their reply resumes you (on a Slack-door task, never ask them to reply on
+  the ticket). Don't guess and barrel ahead.
 - **Clear** → take ownership (Step 2a), then continue to Step 3.
 
 ### Step 2a — Take ownership and enrich the foreman-seeded ticket
@@ -292,10 +287,9 @@ triage records updates** in `factory-tracker-ops`): keep a single live status
 section current in the body and keep plain status updates terse. The one
 exception is a **clarifying question** to a human — deliver that **to the task's
 conversation channel** (tagging the requester, written for a stranger) so their
-reply can resume the run — via a `RELAY:` message to the
-foreman on either door (you cannot post to the conversation yourself, and a
-service-account ticket comment's replies are not routed to the factory) — per
-the door-dependent doctrine, **Who can post where**, and
+reply can resume the run — on a Slack-door task via a `RELAY:` message to the
+foreman (you cannot post to the thread yourself), on a Jira-door task as a Jira
+comment you post — per the door-dependent doctrine, **Who can post where**, and
 the "wait for a human" pattern in `factory-tracker-ops`. Substantive recorded
 content — the
 enriched template, reproduction proof, the chosen path — keeps its full detail

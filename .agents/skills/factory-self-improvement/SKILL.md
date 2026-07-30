@@ -56,13 +56,10 @@ Decide which of two kinds of change the user wants.
   conversation channel — whether this is just for the current task or a
   permanent change going forward — tag the requester, and, per the
   door-dependent doctrine in `factory-tracker-ops`, wait for their reply there
-  (the Slack thread for a Slack-door task; the foreman's conversation,
-  mirrored to the ticket by the Warp app, for a Jira-door
-  task). When you are a child agent, deliver the question
-  via a `RELAY:` message to the foreman on either door (see **Who can post
-  where** in
-  `factory-tracker-ops`) — you cannot post to the conversation yourself. Do
-  not
+  (the Slack thread for a Slack-door task, a ticket comment for a Jira-door
+  task). When you are a child agent on a Slack-door task, deliver the question
+  via a `RELAY:` message to the foreman (see **Who can post where** in
+  `factory-tracker-ops`) — you cannot post to the thread yourself. Do not
   guess when the two readings diverge materially.
 
 ## Step 2 — For a structural change, dispatch a background sub-agent

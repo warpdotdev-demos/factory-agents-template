@@ -372,14 +372,7 @@ tool result:
 `run_agents` call returns `launched`, post **one terse line** in the task's
 conversation channel with the step name and the **child's** Oz run link (built
 from `run_link_template` + the child's `agent_id` — this is the child's run, not
-the foreman's own run) before entering the wait — no preamble, no detail. On
-the Jira door, deliver it by **ending your turn** with this line as your
-reply in plain markdown — the Warp app posts only your end-of-turn replies to
-the ticket (mid-turn narration is never delivered), and never a
-service-account comment via `scripts/tracker comment`. Ending the turn does
-not lose the wait: the child's completion or `RELAY:` message (or the
-human's ticket reply) wakes you, and you re-enter the drain-then-wait loop
-(Step 3) on the resumed turn.
+the foreman's own run) before entering the wait — no preamble, no detail.
 Examples (Slack-door mrkdwn shown; use plain markdown links on the Jira door):
 - `Running triage — <https://<oz-web-host>/runs/<child-run-id>|Oz run>. I'll post results when done.`
 - `Code review dispatched — <https://<oz-web-host>/runs/<child-run-id>|Oz run>. I'll post the verdict here.`
@@ -415,41 +408,24 @@ confirmed done:
    unread.
 
 **Relay messages (`RELAY:`) are delivery requests, not completions.** A child
-cannot post to the task's conversation itself on either door — only you can
-(see
+on a Slack-door task cannot post to the Slack thread itself — only you can (see
 **Who can post where** in `factory-tracker-ops`) — so it delivers any
 within-step gating ask (a clarifying question, the spec approval ask, a
 GitHub-username ask) to you as an agent-to-agent message whose subject starts
 with `RELAY:`. When one arrives during the wait:
-1. **Post the message body to the task's conversation verbatim.** On a
-   Slack-door task, post it to the Slack thread (it arrives pre-formatted in
-   Slack mrkdwn), then keep waiting per item 2. On a Jira-door task, deliver
-   it by **ending your turn with the relayed ask as your entire reply** (it
-   arrives in plain markdown) — the Warp app posts only your end-of-turn
-   replies to the ticket, so quoting the ask mid-turn delivers **nothing**;
-   do not call `wait_for_events` after it (your ended turn *is* the wait),
-   and never post it via `scripts/tracker comment` (a reply to a
-   service-account comment is not routed to the factory). It is written for a
-   stranger — do not rewrite it,
+1. **Post the message body to the task's Slack thread verbatim.** It arrives
+   pre-formatted in Slack mrkdwn, written for a stranger — do not rewrite it,
    summarize it, or answer it yourself, and do **not** treat it as the step's
    completion.
-2. **The pause is mandatory — never answer the ask yourself.** A relayed
-   gating ask is satisfied only by a **real human reply** arriving through
-   the door (a Slack thread reply, or a reply to the Warp app's ticket
-   comment). Never approve, answer, or `continue` on the requester's behalf —
-   a session that looks autonomous or non-interactive is **not** license to
-   skip the human gate, and fabricating the reply (e.g. self-approving a spec
-   "so the loop proceeds") is a hard violation (see **A human gate is
-   answered only by a human** in `factory-tracker-ops`). The step is still in
-   flight: on the Slack door re-enter the drain-then-wait loop; on the Jira
-   door your ended turn is the wait — the human's reply or a child message
-   wakes you. Do not apply labels, post a step result, or advance.
-3. **Forward the human's reply.** When the requester answers in the
-   conversation (the Slack thread, or a reply to the Warp app's comment on the
-   ticket), the
+2. **Keep waiting** — the step is still in flight; re-enter the drain-then-wait
+   loop. Do not apply labels, post a step result, or advance.
+3. **Forward the human's reply.** When the requester answers in the thread, the
    reply wakes **you**, not the child. Forward the reply verbatim to the paused
    child via `send_message_to_agent` (its `agent_id`), then resume the
    drain-then-wait loop until the child reports step completion.
+If a `RELAY:` message arrives for a Jira-door task (the child should have
+posted the Jira comment itself), still deliver it — post it as a Jira comment
+via `scripts/tracker comment` — and keep waiting.
 
 **Bias toward assuming the message was received.** If draining ever surfaces a
 plausible completion signal — a message from the child's `agent_id`, or the durable
@@ -483,10 +459,7 @@ terse line before polling — e.g.
 Then **poll the child**: send it a brief status request via `send_message_to_agent`
 (to its `agent_id`) and re-check the durable signals (the issue's gate label +
 required status/artifact signal via `factory-tracker-ops` / `scripts/factory-state`).
-Repeat at most **3 times**. (On the Jira door, do the poll actions first —
-message the child, re-check the signals — then deliver the notification by
-ending your turn with it as your reply; the child's answer or the next event
-wakes you.)
+Repeat at most **3 times**.
 - If the durable signal shows the step **already finished** (the next gate label
   and its companion signal are present), proceed as if the child reported.
 - If after 3 polls there's still no completion, label change, or required
@@ -497,16 +470,12 @@ gate label + required status/artifact signal) before reporting and advancing.
 
 Within-step human pauses (a clarifying question, or spec approval when
 `spec_approval_required` is `true`) are **child-owned in content but
-foreman-delivered on both doors**: the child writes the ask and sends it to
-you as a `RELAY:` message that you post to the conversation verbatim (the
-Slack thread, or by ending your turn with it as your Jira-door reply, which
-the Warp app posts). The
-child
+foreman-delivered on the Slack door**: the child writes the ask and, on a
+Slack-door task, sends it to you as a `RELAY:` message that you post to the
+thread verbatim (on the Jira door it posts the Jira comment itself). The child
 does *not* message you as complete, so your wait simply continues across that
-pause — you relay the ask, forward the human's reply to the paused
-child, and keep waiting until the step completes. You never supply that
-reply yourself — the gate holds until a real human answers (see **A human
-gate is answered only by a human** in `factory-tracker-ops`).
+pause — you relay the ask, forward the human's thread reply to the paused
+child, and keep waiting until the step completes.
 
 ## Step 4 — Report the step result
 
@@ -523,12 +492,7 @@ PR + In Progress, or review + In Review).
 `continue` handoff, or the merge ask — must be surfaced **in the task's
 conversation channel** per the door-dependent doctrine in `factory-tracker-ops`:
 the Slack thread for a Slack-triggered task (a ticket comment never wakes the
-run), or, on a Jira-triggered task, by **ending your turn with the ask as
-your reply** (the Warp app posts your end-of-turn replies to the ticket and
-routes replies to its comments back to the run — never a service-account
-comment via `scripts/tracker comment`, whose replies are not routed to the
-factory). The gate then holds until a real human answers — never approve or
-continue on their behalf.
+run), or a Jira comment for a Jira-triggered task (the reply wakes the run).
 Write it for a stranger — ticket key, exact question, what a valid reply looks
 like — since the reply may cold-start a fresh foreman that re-derives all state
 from the ticket.
@@ -544,9 +508,8 @@ brief either way.
 
 **Post every link as a compact named hyperlink** and format the whole message
 for the task's door per `factory-progress-updates` — Slack mrkdwn
-(`<url|label>` links) in a Slack thread; plain markdown in your own Jira-door
-conversation response (mirrored to the ticket by the Warp app). Never post a
-bare URL.
+(`<url|label>` links) in a Slack thread; plain markdown (converted to ADF by
+the tracker CLI) in a Jira comment. Never post a bare URL.
 
 ## Step 5 — Advance (the default) or block on a human, by the new label
 
@@ -642,10 +605,8 @@ auto-dispatch. The only exceptions where you **block on a human** are the merge
 ask, a clarifying question, and an exhausted rework budget (spec approval, when
 required by config, is a within-step pause the spec child owns — you just keep
 waiting). Whenever you block, **surface that ask at the top of the response in
-the task's conversation channel** (per Step 4's action-first format) — never
-ask the user to approve or continue via a service-account ticket comment on
-either door (on the Jira door the ask goes in your own response, which the
-Warp app mirrors) —
+the task's conversation channel** (per Step 4's action-first format) — on a
+Slack-door task never ask the user to approve or continue via a ticket comment —
 tag the requester, and **end your turn**.
 
 **Continuation (hybrid).** When the user replies `continue` in the task's

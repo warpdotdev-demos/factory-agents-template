@@ -41,10 +41,9 @@ post a brief note that the PR was closed without merging, and stop.
    carries no open-step signal. This is idempotent — re-asserting Done is a
    no-op.
 3. Post one final message in the task's conversation channel (per the
-   door-dependent doctrine in `factory-tracker-ops`; when running as a child,
-   deliver it to the foreman as a `RELAY:` message on either door — only
-   the foreman can post to the conversation, and a service-account ticket
-   comment is never the conversation, per **Who can post where** in
+   door-dependent doctrine in `factory-tracker-ops`; when running as a child on
+   a Slack-door task, deliver it to the foreman as a `RELAY:` message — only
+   the foreman can post to the Slack thread, per **Who can post where** in
    `factory-tracker-ops`), tagging the requester:
 
    > 🎉 Merged — <PR URL> is in. Thanks <@requester>! Closing this out.

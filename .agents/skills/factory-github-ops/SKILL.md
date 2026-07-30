@@ -362,11 +362,8 @@ review bar as the resolver itself (see `factory-self-update`).
 
 **Fallback — ask the requester.** When the script prints an empty result, ask
 **in the task's conversation channel** (the Slack thread for a Slack-door task,
-or the foreman's own conversation response for a Jira-door task — never a
-service-account Jira comment, whose replies are not routed to the factory —
-per the door-dependent doctrine in
-`factory-tracker-ops`; a child agent cannot post to the conversation itself
-on either door —
+or a Jira comment for a Jira-door task, per the door-dependent doctrine in
+`factory-tracker-ops`; a child agent cannot post to the Slack thread itself —
 it delivers the ask to the foreman as a `RELAY:` message per **Who can post
 where** in `factory-tracker-ops`): tag the person, request their GitHub
 username, include the ticket key and what a valid reply looks like, then end

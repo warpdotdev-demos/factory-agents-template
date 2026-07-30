@@ -319,16 +319,9 @@ via Slack converse in the Slack thread; the Jira ticket stays record-only
 
 Connect the Jira integration as the second door, using the same foreman base
 prompt and environment. Runs triggered from Jira treat the ticket as the
-conversation, carried by the **Warp app integrated with Jira**: the Warp app
-posts the foreman run's **end-of-turn replies** onto the ticket as comments
-(the foreman delivers asks and updates by ending its turn with them), and a
-reply to the Warp app's comments wakes (or cold-starts) a run that picks up
-from the ticket's durable state. On this door the factory posts **no**
-service-account comments (the service account still writes ticket properties
-— status, labels, estimate, PR remote links, description enrichment) — this
-avoids duplicate updates from two commenters, and replying to a
-service-account comment is not supported (see "The record vs. the
-conversation" in `README.md`).
+conversation: the factory posts asks as Jira comments and a reply on the
+ticket wakes (or cold-starts) a run that picks up from the ticket's durable
+state.
 
 ## 11. Smoke-test with the mock providers
 

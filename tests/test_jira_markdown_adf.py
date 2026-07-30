@@ -34,38 +34,14 @@ class MarkdownToAdfTest(unittest.TestCase):
     def test_paragraphs_split_on_blank_lines(self):
         doc = jira.markdown_to_adf("first line\nstill first\n\nsecond")
         self.assertEqual([b["type"] for b in doc["content"]], ["paragraph", "paragraph"])
-        # A single newline within a paragraph is preserved as a hardBreak so
-        # multi-line comment bodies keep their line structure in Jira.
         self.assertEqual(
             doc["content"][0]["content"],
-            [
-                {"type": "text", "text": "first line"},
-                {"type": "hardBreak"},
-                {"type": "text", "text": "still first"},
-            ],
+            [{"type": "text", "text": "first line still first"}],
         )
         self.assertEqual(
             doc["content"][1]["content"],
             [{"type": "text", "text": "second"}],
         )
-
-    def test_single_newlines_render_as_hard_breaks(self):
-        # Regression: a multi-line status comment (e.g. "Code review complete
-        # for PR #4" followed by one step per line) must not collapse into a
-        # single run-on paragraph.
-        body = (
-            "Code review complete for PR #4\n"
-            "\u2705 CI checks passed\n"
-            "\u2705 Rubric review posted\n"
-            "Verdict: accepted"
-        )
-        doc = jira.markdown_to_adf(body)
-        (para,) = doc["content"]
-        self.assertEqual(para["type"], "paragraph")
-        breaks = [n for n in para["content"] if n.get("type") == "hardBreak"]
-        self.assertEqual(len(breaks), 3)
-        # Round-trips back to the same multi-line text.
-        self.assertEqual(jira.adf_to_text(doc), body)
 
     def test_heading_levels(self):
         doc = jira.markdown_to_adf("## Rollout plan")
