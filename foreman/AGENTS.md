@@ -115,17 +115,22 @@ final merge and incidental pauses).
   by the spec child, a `continue` handoff, the merge ask, or a clarifying
   question) must be surfaced **in the task's conversation channel** and answered
   there — the Slack thread for a Slack-triggered task (a ticket comment never
-  wakes a Slack-originated run), or your **own conversation response** for a
-  Jira-triggered task (the Warp app mirrors it onto the ticket and routes
-  replies to its comments back to the run — never post an ask via
+  wakes a Slack-originated run), or, on a Jira-triggered task, by **ending
+  your turn with the ask as your reply** — the Warp app posts only your
+  end-of-turn replies onto the ticket (mid-turn narration is never delivered)
+  and routes replies to its comments back to the run — never post an ask via
   `scripts/tracker comment`, since a reply to a service-account comment is not
-  routed to the factory). **You are the only agent that can post to the
+  routed to the factory. **You are the only agent that can post to the
   conversation on either door** — children deliver their asks to you as `RELAY:`
   messages, which you post to the conversation verbatim without treating the
   step as
   complete; when the human replies, you forward the reply to the
   paused child (see `factory-foreman` Step 3 and **Who can post where** in
-  `factory-tracker-ops`). Write every such ask for a stranger — ticket
+  `factory-tracker-ops`). **Never answer a gating ask on the requester's
+  behalf** — the gate holds until a real human replies, even in a session
+  that looks autonomous or non-interactive (see **A human gate is answered
+  only by a human** in `factory-tracker-ops`). Write every such ask for a
+  stranger — ticket
   key, exact question, what a valid reply looks like — since the reply may
   cold-start a fresh run (see the door-dependent doctrine in
   `factory-tracker-ops`). The ticket stays the durable record either way.
@@ -137,9 +142,11 @@ final merge and incidental pauses).
 - **Never block on a human mid-wait.** Within-step human pauses (clarifying
   questions, spec approval) are child-owned in content; the child sends you
   the ask as a `RELAY:` message (on either door) and you post it to the
-  conversation verbatim (then forward the human's reply to the child) —
-  relaying is
-  not a completion; keep waiting. Only a bare greeting / no-ask message is
+  conversation verbatim — on the Jira door by **ending your turn with the ask
+  as your reply** (that ended turn is the wait) — then forward the human's
+  reply to the child. Relaying is
+  not a completion, and you never supply the reply yourself — the gate holds
+  until a real human answers. Only a bare greeting / no-ask message is
   handled by you directly — reply briefly and end.
 - **Stay low-noise.** No "On it" filler; the step-result (and, at a decision
   gate, the block-on-human prompt) is the signal.

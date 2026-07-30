@@ -178,9 +178,11 @@ then stop:
    after the `run_agents` dispatch returns `launched` (the run link is built from
    `factory-dispatch`'s `run_link_template` + the returned `agent_id`). Before
    entering the wait. Every dispatch, including auto-advance hops. Post it in
-   the Slack thread on a Slack-door task, or as your own conversation response
-   on a Jira-door task (the Warp app mirrors it — never a service-account
-   comment).
+   the Slack thread on a Slack-door task; on a Jira-door task deliver it by
+   ending your turn with the line as your reply (the Warp app posts only
+   end-of-turn replies — mid-turn narration is never delivered, and never use
+   a service-account comment). The child's messages wake you to resume the
+   wait loop.
 2. **On user follow-up during a wait (status check only):** if the user is
    asking for a progress update and the answer requires tool calls, post one
    line with the current step + child Oz run link before those tool calls.

@@ -208,9 +208,15 @@ determined by which door the request came through:
   reply back to the paused child (see "Who can post where" in
   `factory-tracker-ops`).
 - **Jira-triggered runs** treat the ticket **as** the conversation — carried
-  by the **Warp app integrated with Jira**, which mirrors the foreman run's
-  responses onto the ticket and routes replies to its comments back to the
-  run (a reply wakes or cold-starts the run). Because the Warp app already
+  by the **Warp app integrated with Jira**, which posts the foreman run's
+  **end-of-turn replies** onto the ticket and routes replies to its comments
+  back to the
+  run (a reply wakes or cold-starts the run). The foreman therefore delivers
+  every ask and update by ending its turn with that message as its reply —
+  mid-turn narration is never mirrored — and every human gate (spec approval,
+  clarifying questions, the merge ask) pauses there until a real human
+  replies; agents never answer on the requester's behalf. Because the Warp
+  app already
   posts the run's updates, agents post **no service-account comments** on a
   Jira-door ticket (no progress comments, PR-link comments, or verdict
   comments — the foreman's mirrored responses carry those instead); replying

@@ -373,9 +373,13 @@ tool result:
 conversation channel with the step name and the **child's** Oz run link (built
 from `run_link_template` + the child's `agent_id` — this is the child's run, not
 the foreman's own run) before entering the wait — no preamble, no detail. On
-the Jira door this line is your **own conversation response** in plain
-markdown (the Warp app mirrors it to the ticket) — never a service-account
-comment via `scripts/tracker comment`.
+the Jira door, deliver it by **ending your turn** with this line as your
+reply in plain markdown — the Warp app posts only your end-of-turn replies to
+the ticket (mid-turn narration is never delivered), and never a
+service-account comment via `scripts/tracker comment`. Ending the turn does
+not lose the wait: the child's completion or `RELAY:` message (or the
+human's ticket reply) wakes you, and you re-enter the drain-then-wait loop
+(Step 3) on the resumed turn.
 Examples (Slack-door mrkdwn shown; use plain markdown links on the Jira door):
 - `Running triage — <https://<oz-web-host>/runs/<child-run-id>|Oz run>. I'll post results when done.`
 - `Code review dispatched — <https://<oz-web-host>/runs/<child-run-id>|Oz run>. I'll post the verdict here.`
@@ -419,15 +423,27 @@ GitHub-username ask) to you as an agent-to-agent message whose subject starts
 with `RELAY:`. When one arrives during the wait:
 1. **Post the message body to the task's conversation verbatim.** On a
    Slack-door task, post it to the Slack thread (it arrives pre-formatted in
-   Slack mrkdwn); on a Jira-door task, post it as your **own conversation
-   response** (it arrives in plain markdown; the Warp app mirrors it to the
-   ticket — never post it via `scripts/tracker comment`, since a reply to a
+   Slack mrkdwn), then keep waiting per item 2. On a Jira-door task, deliver
+   it by **ending your turn with the relayed ask as your entire reply** (it
+   arrives in plain markdown) — the Warp app posts only your end-of-turn
+   replies to the ticket, so quoting the ask mid-turn delivers **nothing**;
+   do not call `wait_for_events` after it (your ended turn *is* the wait),
+   and never post it via `scripts/tracker comment` (a reply to a
    service-account comment is not routed to the factory). It is written for a
    stranger — do not rewrite it,
    summarize it, or answer it yourself, and do **not** treat it as the step's
    completion.
-2. **Keep waiting** — the step is still in flight; re-enter the drain-then-wait
-   loop. Do not apply labels, post a step result, or advance.
+2. **The pause is mandatory — never answer the ask yourself.** A relayed
+   gating ask is satisfied only by a **real human reply** arriving through
+   the door (a Slack thread reply, or a reply to the Warp app's ticket
+   comment). Never approve, answer, or `continue` on the requester's behalf —
+   a session that looks autonomous or non-interactive is **not** license to
+   skip the human gate, and fabricating the reply (e.g. self-approving a spec
+   "so the loop proceeds") is a hard violation (see **A human gate is
+   answered only by a human** in `factory-tracker-ops`). The step is still in
+   flight: on the Slack door re-enter the drain-then-wait loop; on the Jira
+   door your ended turn is the wait — the human's reply or a child message
+   wakes you. Do not apply labels, post a step result, or advance.
 3. **Forward the human's reply.** When the requester answers in the
    conversation (the Slack thread, or a reply to the Warp app's comment on the
    ticket), the
@@ -467,7 +483,10 @@ terse line before polling — e.g.
 Then **poll the child**: send it a brief status request via `send_message_to_agent`
 (to its `agent_id`) and re-check the durable signals (the issue's gate label +
 required status/artifact signal via `factory-tracker-ops` / `scripts/factory-state`).
-Repeat at most **3 times**.
+Repeat at most **3 times**. (On the Jira door, do the poll actions first —
+message the child, re-check the signals — then deliver the notification by
+ending your turn with it as your reply; the child's answer or the next event
+wakes you.)
 - If the durable signal shows the step **already finished** (the next gate label
   and its companion signal are present), proceed as if the child reported.
 - If after 3 polls there's still no completion, label change, or required
@@ -480,11 +499,14 @@ Within-step human pauses (a clarifying question, or spec approval when
 `spec_approval_required` is `true`) are **child-owned in content but
 foreman-delivered on both doors**: the child writes the ask and sends it to
 you as a `RELAY:` message that you post to the conversation verbatim (the
-Slack thread, or your own Jira-door response mirrored by the Warp app). The
+Slack thread, or by ending your turn with it as your Jira-door reply, which
+the Warp app posts). The
 child
 does *not* message you as complete, so your wait simply continues across that
 pause — you relay the ask, forward the human's reply to the paused
-child, and keep waiting until the step completes.
+child, and keep waiting until the step completes. You never supply that
+reply yourself — the gate holds until a real human answers (see **A human
+gate is answered only by a human** in `factory-tracker-ops`).
 
 ## Step 4 — Report the step result
 
@@ -501,10 +523,12 @@ PR + In Progress, or review + In Review).
 `continue` handoff, or the merge ask — must be surfaced **in the task's
 conversation channel** per the door-dependent doctrine in `factory-tracker-ops`:
 the Slack thread for a Slack-triggered task (a ticket comment never wakes the
-run), or your own conversation response for a Jira-triggered task (the Warp
-app mirrors it to the ticket and routes replies to its comments back to the
-run — never a service-account comment via `scripts/tracker comment`, whose
-replies are not routed to the factory).
+run), or, on a Jira-triggered task, by **ending your turn with the ask as
+your reply** (the Warp app posts your end-of-turn replies to the ticket and
+routes replies to its comments back to the run — never a service-account
+comment via `scripts/tracker comment`, whose replies are not routed to the
+factory). The gate then holds until a real human answers — never approve or
+continue on their behalf.
 Write it for a stranger — ticket key, exact question, what a valid reply looks
 like — since the reply may cold-start a fresh foreman that re-derives all state
 from the ticket.

@@ -71,13 +71,19 @@ The door determines where every gating ask and update goes.
 - **Jira-triggered task.** The ticket's comment thread is the conversation —
   but it is carried by the **Warp app integrated with Jira**, not by the
   service account. The Warp app mirrors the foreman run's responses onto the
-  ticket and routes replies to the Warp app's comments back to the run.
+  ticket and routes replies to the Warp app's comments back to the run. What
+  the Warp app posts is the foreman's **end-of-turn reply** — the message the
+  foreman finishes its turn with. Mid-turn narration, quoted text between
+  tool calls, and tool output are **never** mirrored, so on this door
+  "posting" a message means **ending the turn with that message as the
+  response**.
   Because the Warp app already posts the run's updates, agents must **not**
   post ticket comments via `scripts/tracker comment` on a Jira-door task — a
   service-account comment duplicates the Warp app's update, and a reply to a
   service-account comment is not routed to the factory. The foreman delivers
-  every ask, dispatch notification, and step result as its **own
-  conversation response** (the Warp app surfaces it on the ticket); children
+  every ask, dispatch notification, and step result by **ending its turn
+  with that message as its reply** (the Warp app then posts it on the
+  ticket); children
   deliver theirs through the foreman as `RELAY:` messages (see **Who can
   post where** below). Ticket properties (status, labels, estimate, remote
   links, description edits) are still written via `scripts/tracker`.
@@ -101,7 +107,8 @@ doors.
   the ask (written for a stranger) — Slack mrkdwn on a Slack-door task, plain
   markdown on a Jira-door task — then end the turn. The foreman posts that
   text to the conversation verbatim — into the Slack thread on the Slack door,
-  or as its own conversation response on the Jira door (never via
+  or on the Jira door by ending its turn with the ask as its reply so the
+  Warp app posts it (never via
   `scripts/tracker comment`). The human's reply wakes the **foreman**, which
   forwards it verbatim to the paused child — that forwarded message is what
   resumes the child.
@@ -129,6 +136,20 @@ where replies actually work. Reply instructions belong only in the
 conversation channel — the foreman-posted Slack thread message, or the
 foreman's own conversation response on the Jira door (mirrored by the Warp
 app, whose comments do route replies back to the run).
+
+### A human gate is answered only by a human (hard rule)
+
+A gating ask — spec approval, a clarifying question, the merge ask, or any
+`continue` — pauses the loop until a **real human reply** arrives through the
+door. No agent may ever answer, approve, or `continue` on the requester's
+behalf, and a session that looks autonomous or non-interactive is **not**
+license to skip the pause — deliver the ask (per **Who can post where**
+above), end the turn, and wait. Fabricating or assuming the reply (for
+example, self-approving a spec "so the loop proceeds") is a hard violation
+that breaks the human gate. On the Jira door, delivery means the foreman
+ends its turn with the ask as its reply (the Warp app posts it to the
+ticket); the requester's reply to that Warp app comment is what wakes the
+run and satisfies the gate.
 
 **Write every gate ask for a stranger.** A reply may cold-start a **fresh** run
 that re-derives all state from the ticket, so the ask itself must carry the
@@ -586,10 +607,11 @@ You cannot block. When a step needs human input that gates its own progress (a
 clarifying question, spec approval, merge ask, or any `continue`), do this.
 1. **Deliver the ask to the task's conversation channel, by role and door**
    (see **Who can post where** above).
-   - **Foreman** — post it directly in the Slack thread on a Slack-door task,
-     or as your own conversation response on a Jira-door task (the Warp app
-     mirrors it to the ticket; never post the ask via
-     `scripts/tracker comment` — a reply to a service-account comment is not
+   - **Foreman** — post it directly in the Slack thread on a Slack-door task.
+     On a Jira-door task, **end your turn with the ask as your reply** — the
+     Warp app posts only end-of-turn replies to the ticket, so an ask quoted
+     mid-turn is never delivered; never post the ask via
+     `scripts/tracker comment` (a reply to a service-account comment is not
      routed to the factory).
    - **Child agent (either door)** — you cannot post to the conversation; send
      the foreman a `RELAY:` message carrying the exact text to post (Slack
@@ -609,4 +631,6 @@ clarifying question, spec approval, merge ask, or any `continue`), do this.
    thread reply wakes the **foreman**, which forwards it to the paused child
    when the ask was a child's relayed ask. Either way, the agent re-derives
    external state from the task record + `scripts/factory-state`.
-Don't poll in a loop waiting — it wastes the run.
+Don't poll in a loop waiting — it wastes the run. And never "unblock"
+yourself by assuming or fabricating the reply — the pause holds until a real
+human answers (see **A human gate is answered only by a human** above).
