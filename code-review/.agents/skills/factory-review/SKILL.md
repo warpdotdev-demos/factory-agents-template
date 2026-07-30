@@ -50,12 +50,15 @@ full conversation history of your prior actions. So:
   `factory-tracker-ops`.
 
 You cannot block waiting for a human. When you need input, deliver the request
-**to the task's conversation channel** — but note **you cannot post to a Slack
-thread yourself**; only the foreman can. On a Slack-triggered task, send the
+**to the task's conversation channel** — but note **you cannot post to the
+conversation yourself on either door**; only the foreman can. Send the
 foreman a `RELAY:` message (agent-to-agent, to your coordination footer's run
-id) whose body is the exact Slack-mrkdwn text to post — the foreman posts it
-to the thread verbatim and forwards the human's reply back to you. On a
-Jira-triggered task, post the Jira comment yourself. Write every ask for a
+id) whose body is the exact text to post — Slack mrkdwn on a Slack-triggered
+task, plain markdown on a Jira-triggered task — the foreman posts it
+to the conversation verbatim and forwards the human's reply back to you.
+Never post the ask as a service-account Jira comment
+(`scripts/tracker comment`) — replies to those are not routed to the factory.
+Write every ask for a
 stranger (ticket key + question + what a valid reply looks like), and **end
 your turn**; the reply resumes you later (see the door-dependent doctrine and
 **Who can post where** in `factory-tracker-ops`).
@@ -89,8 +92,8 @@ Then gate on the `impl-done` label:
   wrong-label message (it needs `impl-done`; state what it has) and **end
   your turn**. Do no review.
 - **No linked ticket** → post a brief error asking the requester to
-  provide the ticket link **in the conversation** (via the foreman `RELAY:`
-  message on a Slack-door task, per **Who can post where** in
+  provide the ticket link **in the conversation** (via a `RELAY:` message to
+  the foreman on either door, per **Who can post where** in
   `factory-tracker-ops`), tag them, and end your turn.
 
 You set the ticket's **accepted/rejected** status via the **terminal** gate label
@@ -137,17 +140,21 @@ Work top-down; take the **first** branch that matches.
 Identify the PR under review. If the message names it, use that; otherwise find
 the task's PR with `scripts/factory-pr-meta find` (see `factory-github-ops`). If
 you can't determine the PR, ask one concise clarifying question in the task's
-conversation channel (via the foreman `RELAY:` message on a Slack-door task, or
-a Jira comment you post on a Jira-door task), tag the requester, and **end your
+conversation channel (via a `RELAY:` message to the foreman on either door),
+tag the requester, and **end your
 turn**.
 
-Take ownership: keep a live status comment per `factory-progress-updates` —
+Take ownership. On a **Slack-door** task, keep a live status comment per
+`factory-progress-updates` —
 post it once at the start of review (capturing the returned comment `id`), then
 update that same comment via `scripts/tracker update-comment --issue <KEY>
 --comment-id <id> --body ...` as each step completes. Do **not** post a new
 comment for each step change, and do **not** use GFM checkbox syntax
 (`- [x]` / `- [ ]`) — the Jira ADF converter renders them as plain text;
-use ✅ / ⬜ symbols or plain-text step labels instead. Then:
+use ✅ / ⬜ symbols or plain-text step labels instead. On a **Jira-door** task,
+skip the live status comment entirely — service-account comments are
+prohibited there (see `factory-tracker-ops`); progress reaches the ticket via
+the foreman's conversation. Then:
 
 0. **Read the target repo's review skills first.** Before running `review-pr`,
    check whether the target repo ships its own review skills under
@@ -213,8 +220,14 @@ PR feedback, use the "Read ALL PR feedback surfaces" procedure in
 `factory-github-ops` — `gh pr view --comments` omits the inline / file-level
 `pulls/<n>/comments`.
 
-Then post a notification on the task's record (tag the author) with the PR link,
-verdict, a one-line summary, and the review link, per `factory-tracker-ops`.
+Then, on a **Slack-door** task, post a notification on the task's record (tag
+the author) with the PR link,
+verdict, a one-line summary, and the review link, per `factory-tracker-ops` —
+format it in plain markdown with each item on its own line, and never ask the
+reader to reply to it (it is a service-account comment; replies are not routed
+to the factory). On a **Jira-door** task post no such comment — the same
+content travels in your completion report to the foreman, whose step result
+reaches the ticket via the Warp app.
 **Report back to the foreman on every outcome — completion or block — then end
 your turn.** Whether the verdict accepted the change (`review-done`) or
 rejected it (`blocked`), and likewise if you hit a blocker or error anywhere in

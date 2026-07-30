@@ -197,17 +197,34 @@ determined by which door the request came through:
 
 - **Slack-triggered runs** converse in the Slack thread. Asks, approvals, and
   the merge request go to the thread; the Jira ticket stays **record-only**.
-  Ticket comments never wake a Slack-originated run, so when an agent posts a
-  record-keeping comment on the ticket it includes a one-line pointer to the
-  live Slack thread where the conversation is actually happening. **Only the
+  Agents document progress and artifacts on the ticket as service-account
+  comments, but ticket comments never wake a Slack-originated run — so each
+  record-keeping comment includes a one-line pointer to the
+  live Slack thread where the conversation is actually happening, and never
+  asks the reader to reply to it. **Only the
   foreman run can post to the Slack thread** — child steps deliver any
   thread-bound ask (a clarifying question, spec approval) to the foreman as a
   `RELAY:` message; the foreman posts it verbatim and forwards the human's
   reply back to the paused child (see "Who can post where" in
   `factory-tracker-ops`).
-- **Jira-triggered runs** treat the ticket **as** the conversation: asks are
-  posted as Jira comments, and a reply on the ticket wakes (or cold-starts)
-  the run.
+- **Jira-triggered runs** treat the ticket **as** the conversation — carried
+  by the **Warp app integrated with Jira**, which mirrors the foreman run's
+  responses onto the ticket and routes replies to its comments back to the
+  run (a reply wakes or cold-starts the run). Because the Warp app already
+  posts the run's updates, agents post **no service-account comments** on a
+  Jira-door ticket (no progress comments, PR-link comments, or verdict
+  comments — the foreman's mirrored responses carry those instead); replying
+  to a service-account comment is not supported and reaches nothing. Ticket
+  **properties** — status, gate labels, estimate, PR remote links, and the
+  triage description enrichment — are still written via `scripts/tracker` on
+  both doors. Child steps deliver conversation-bound asks to the foreman as
+  `RELAY:` messages on this door too.
+
+Service-account ticket comments (posted via `scripts/tracker comment`)
+therefore appear only on Slack-door tasks, and none of them may instruct the
+reader to reply to the comment to trigger an action — replies to
+service-account comments are not routed to the factory (see
+"Service-account comments never solicit replies" in `factory-tracker-ops`).
 
 Every gate ask is **written for a stranger**: it carries the ticket key,
 enough context to act without the thread's history, and a description of what

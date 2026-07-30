@@ -79,6 +79,9 @@ attempt counter exactly once:
 scripts/factory-pr-meta bump-ci-attempt --pr <pr> --repo <task's target repo>
 ```
 
-Post a terse update on the task (CI fix pushed, attempt n/3) via
-`factory-tracker-ops`, report the outcome to the foreman, then **end your turn**.
+Post a terse update on the task (CI fix pushed, attempt n/3) per
+`factory-tracker-ops` — a record comment on a Slack-door task; on a Jira-door
+task the update travels in your report to the foreman instead (no
+service-account comment) — report the outcome to the foreman, then **end your
+turn**.
 Do not change the issue's pipeline label from this helper.

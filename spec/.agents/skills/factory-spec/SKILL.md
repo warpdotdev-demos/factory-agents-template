@@ -67,12 +67,15 @@ full conversation history of your prior actions. So:
 
 You cannot block waiting for a human. When you need input (clarification, or
 spec approval when required), deliver the request **to the task's conversation
-channel** — but note **you cannot post to a Slack thread yourself**; only the
-foreman can. On a Slack-triggered task, send the foreman a `RELAY:` message
+channel** — but note **you cannot post to the conversation yourself on either
+door**; only the
+foreman can. Send the foreman a `RELAY:` message
 (agent-to-agent, to your coordination footer's run id) whose body is the
-exact Slack-mrkdwn text to post — the foreman posts it to the thread verbatim
-and forwards the human's reply back to you. On a Jira-triggered task, post
-the Jira comment yourself. Write every ask for a stranger (ticket key +
+exact text to post — Slack mrkdwn on a Slack-triggered task, plain markdown
+on a Jira-triggered task — the foreman posts it to the conversation verbatim
+and forwards the human's reply back to you. Never post the ask as a
+service-account Jira comment (`scripts/tracker comment`) — replies to those
+are not routed to the factory. Write every ask for a stranger (ticket key +
 question + what a valid reply looks like), and **end your turn**; the reply
 resumes you later (see the door-dependent doctrine and **Who can post where**
 in `factory-tracker-ops`).
@@ -181,8 +184,8 @@ Work top-down; take the **first** branch that matches.
      actual feedback (see "Rework: GitHub is the source of truth"). Then revise
      (Steps 3–5; re-investigate if needed, reusing the same steerable run via a
      followup to it), **commit and push the update to the same branch/PR**,
-     re-request approval in the conversation (via the foreman `RELAY:` message
-     on a Slack-door task, per Step 5), and end turn.
+     re-request approval in the conversation (via the foreman `RELAY:` message,
+     per Step 5), and end turn.
    - **Ambiguous** → ask one concise clarifying question, tag the author, end.
 4. **Abort / cancel.** The newest message asks you to stop, or there is no real
    work. Set status **Canceled** via `factory-tracker-ops`, post one brief reply,
@@ -259,7 +262,10 @@ Give the run a tight brief:
   `factory-verification`).
 - Tell it to report findings back to you.
 
-Post the Oz run link to the task's record so humans can steer:
+Surface the Oz run link so humans can steer. On a Slack-door task post it as a
+record comment on the ticket; on a Jira-door task send it to the foreman as a
+`RELAY:` one-liner to post in the conversation (never a service-account
+comment):
 > 🔍 Investigating — you can watch or steer here: <Oz run link>. I'll post a
 > spec shortly.
 
@@ -431,8 +437,8 @@ reused by implementation, so the spec phase is the primary assigner — assign t
 task requester as a reviewer now via the resolve → assign → fallback flow in
 `factory-github-ops` (`scripts/factory-resolve-reviewer` then
 `gh pr edit --add-reviewer <handle>`; if no handle resolves, ask the requester for
-their GitHub username **in the task's conversation channel** — via the foreman
-`RELAY:` message on a Slack-door task, or a Jira comment you post yourself —
+their GitHub username **in the task's conversation channel** — via a `RELAY:`
+message to the foreman on either door —
 and assign on resume — never guess). Implementation reuses this PR without
 re-adding the requester, so the final PR carries the requester exactly once.
 
@@ -443,8 +449,10 @@ self-contained** in Step 4) — no open question left for the implementor.
 
 **When `spec_approval_required` is `false` — complete immediately.** Apply
 `spec-done` and remove `triage-done` via `factory-tracker-ops` (the ticket
-stays **In Progress**, the PR stays a **draft**), post one brief notification
-with the spec PR link in the task's conversation channel (no approval ask), and
+stays **In Progress**, the PR stays a **draft**), post one brief "spec
+committed" notification with the spec PR link on a Slack-door task (a record
+comment on the ticket — no approval ask; on a Jira-door task skip the comment,
+the foreman's step result carries the PR link), and
 **report completion to the foreman** (per the coordination footer) with the
 spec PR link + the applied label. Applying `spec-done` auto-triggers
 implementation. End your turn.
@@ -453,37 +461,38 @@ implementation. End your turn.
 Deliver the approval ask **to the task's conversation channel** — **tagging
 the requester**, **returning the PR link**, and asking for explicit approval
 **there**, leading with the approval ask per the action-first rule in
-`factory-progress-updates`. How you deliver it depends on the door (per the
-door-dependent doctrine and **Who can post where** in `factory-tracker-ops`):
-- **Slack-door task** — **you cannot post to the Slack thread yourself; only
-  the foreman can.** Do not attempt to post there or hunt for Slack access.
-  Send the foreman a `RELAY:` message (agent-to-agent, to your coordination
-  footer's run id) whose body is the exact Slack-mrkdwn approval ask to post.
-  The foreman posts it to the thread verbatim and forwards the requester's
-  reply back to you. Never tell the requester to approve via a ticket
-  comment — a ticket comment does not wake the run.
-- **Jira-door task** — post the approval ask yourself as a Jira comment via
-  `scripts/tracker comment`.
+`factory-progress-updates`. **You cannot post to the conversation yourself on
+either door; only the foreman can** (per the door-dependent doctrine and
+**Who can post where** in `factory-tracker-ops`). Do not attempt to post
+there or hunt for Slack access, and never post the approval ask as a
+service-account Jira comment via `scripts/tracker comment` — a reply to a
+service-account comment is not routed to the factory. Instead, send the
+foreman a `RELAY:` message (agent-to-agent, to your coordination footer's run
+id) whose body is the exact approval ask to post — Slack mrkdwn on a
+Slack-door task, plain markdown on a Jira-door task. The foreman posts it to
+the conversation verbatim (the Slack thread, or its own Jira-door response
+mirrored to the ticket by the Warp app) and forwards the requester's reply
+back to you.
 Write it **for a stranger** — carry the ticket key, the exact ask, and what a
 valid reply looks like, because on the Jira door the reply may cold-start a
 fresh run that re-derives all state from the ticket. Then **end your turn** —
-the approval reply resumes you (forwarded by the foreman on the Slack door),
+the approval reply resumes you (forwarded by the foreman),
 and you handle it via Step 1 (**Approval pending**), which on approval applies
 `spec-done` to queue the work. The task stays **In Progress** (the PR stays a
 **draft**) while the spec awaits approval.
 
 This approval wait is a **within-step human pause**: do **not** send the
 foreman a **completion** message now (per the coordination footer) — the
-Slack-door `RELAY:` message is the one message you do send it here, and it is
+`RELAY:` message is the one message you do send it here, and it is
 a delivery request, not a completion report. You report completion to the
 foreman only **after** approval, when you apply `spec-done` (Step 1, Approval
 pending) — until then the step isn't done. Applying `spec-done` on
 approval **auto-triggers implementation** (the foreman auto-dispatches it with no
 user gate), so approval is the only go-ahead the user needs to give.
 
-Approval-ask template (shown in Slack mrkdwn for a Slack-door task, where it
-becomes the body of the `RELAY:` message you send the foreman; write the same
-content as a plain-markdown Jira comment on a Jira-door task):
+Approval-ask template (shown in Slack mrkdwn for a Slack-door task; on a
+Jira-door task write the same content in plain markdown — either way it
+becomes the body of the `RELAY:` message you send the foreman):
 
 > <@requester> here's the proposed spec for *<ticket key>* and how I'll verify
 > it, committed as a draft PR: <spec PR link>. Reply *approved* *here* and
@@ -507,21 +516,22 @@ changes-requested reply, or a resume where a spec PR already exists):
    feedback surfaces" procedure in `factory-github-ops`.
 3. **Revise, commit, and push to the same branch/PR** with a descriptive commit
    message; keep the PR a draft and (when approval is required) re-request
-   approval in the conversation (via the foreman `RELAY:` message on a
-   Slack-door task, per Step 5).
+   approval in the conversation (via the foreman `RELAY:` message, per
+   Step 5).
 Never open a second spec PR for the same task — always update the existing one.
 
 ## How to communicate while you work
 
-Follow `factory-progress-updates`: keep one live status comment current and plain
+Follow `factory-progress-updates`: keep one live status comment current on a
+Slack-door task (none on a Jira-door task — no service-account comments
+there) and plain
 status posts terse. Substantive messages — clarifying questions and the spec
 approval ask (with the PR link) — keep full detail. Record progress and the spec
 PR link on the ticket through `factory-tracker-ops` (the spec body itself lives in
 the committed file, not a comment). Never block on a human: deliver any gating
 ask (a clarifying question or spec approval) **to the task's conversation
-channel** per the door-dependent doctrine — via the foreman `RELAY:` message
-on a Slack-door task, or a Jira comment you post yourself on a Jira-door
-task — written for a stranger — and end your turn.
+channel** per the door-dependent doctrine — via a `RELAY:` message to the
+foreman on either door — written for a stranger — and end your turn.
 
 On any **terminal** outcome — an error, a blocker that ends the step, or
 completion — report back to the foreman (per the coordination footer) and end

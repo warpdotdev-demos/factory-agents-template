@@ -43,8 +43,10 @@ create tickets. Adopt the `task_id` from the brief (fast path) or drain your
 inbox for a `{"task_id",...}` message from the foreman (parallel-dispatch path).
 If still none, post a brief error in the conversation and end — delivered per
 **Who can post where** in `factory-tracker-ops` (via a `RELAY:` message to the
-foreman on a Slack-door task; you cannot post to the Slack thread yourself).
-Post the verdict notification to the ticket once the task_id is established.
+foreman on either door; you cannot post to the conversation yourself).
+Post the verdict notification to the ticket once the task_id is established —
+on a Slack-door task only; on a Jira-door task the verdict reaches the ticket
+via your completion report to the foreman (no service-account comment).
 
 ## Pipeline gate
 Gate on the `impl-done` label per `factory-tracker-ops`: if the linked

@@ -37,11 +37,11 @@ that records triage completion (or ask for clarification).
   only externally-mutable state (task status, new human comments, PR open/merged
   + reviewers) each turn via `scripts/factory-state` + `factory-tracker-ops`.
 - **Never block on a human.** When you need input, deliver the ask **to the
-  task's conversation channel** — on a Slack-triggered task via a `RELAY:`
-  message to the foreman, which posts it to the thread for you and forwards
-  the reply back (you cannot post to Slack yourself, and a ticket comment
-  never wakes such a run); on a Jira-triggered task as a Jira comment you post
-  yourself — written for a stranger (ticket key + question + what a valid
+  task's conversation channel** via a `RELAY:` message to the foreman (on
+  either door), which posts it to the conversation for you and forwards the
+  reply back — you cannot post to the conversation yourself, and a
+  service-account ticket comment never wakes a run on either door — written
+  for a stranger (ticket key + question + what a valid
   reply looks like), then **end your turn**; the reply resumes you later (see
   the door-dependent doctrine and **Who can post where** in
   `factory-tracker-ops`).
@@ -60,10 +60,11 @@ that records triage completion (or ask for clarification).
   durable completion record.
 - **Record updates in the description.** Triage logs its findings/progress by
   appending to the issue **description** (`scripts/tracker update-issue
-  --append-description`), not as comments — every other agent comments. The lone
+  --append-description`), not as comments — every other agent comments on
+  Slack-door tasks only. The lone
   exception is a clarifying question to a human, which is delivered **to the
   task's conversation channel** (tagging the requester) so their reply can
-  resume the run — via the foreman `RELAY:` relay on a Slack-door task. See
+  resume the run — via the foreman `RELAY:` relay on either door. See
   `factory-tracker-ops`.
 - **Stay low-noise.** Keep one live status section, terse; no "On it" filler.
 

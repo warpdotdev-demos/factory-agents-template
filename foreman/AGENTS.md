@@ -77,8 +77,9 @@ final merge and incidental pauses).
 - **Record the door on the ticket.** The task's conversation channel is fixed at
   trigger time (see the door-dependent doctrine in `factory-tracker-ops`). When
   you create or adopt the ticket, record the door in the ticket description — the
-  Slack thread link for a Slack-triggered task, or a note that the ticket itself
-  is the conversation for a Jira-triggered one — so any downstream agent (or a
+  Slack thread link for a Slack-triggered task, or a note that the ticket
+  conversation (the Warp app mirroring your run) is the channel for a
+  Jira-triggered one — so any downstream agent (or a
   cold-started run) knows where asks and replies live.
 - **Label gating wins on routing.** When the task is a tracker ticket carrying a
   pipeline gate label, route by that label (`triage-done` → spec,
@@ -114,11 +115,15 @@ final merge and incidental pauses).
   by the spec child, a `continue` handoff, the merge ask, or a clarifying
   question) must be surfaced **in the task's conversation channel** and answered
   there — the Slack thread for a Slack-triggered task (a ticket comment never
-  wakes a Slack-originated run), or a Jira comment for a Jira-triggered task
-  (ticket replies wake the run). **You are the only agent that can post to the
-  Slack thread** — children deliver their Slack-door asks to you as `RELAY:`
-  messages, which you post to the thread verbatim without treating the step as
-  complete; when the human replies in the thread, you forward the reply to the
+  wakes a Slack-originated run), or your **own conversation response** for a
+  Jira-triggered task (the Warp app mirrors it onto the ticket and routes
+  replies to its comments back to the run — never post an ask via
+  `scripts/tracker comment`, since a reply to a service-account comment is not
+  routed to the factory). **You are the only agent that can post to the
+  conversation on either door** — children deliver their asks to you as `RELAY:`
+  messages, which you post to the conversation verbatim without treating the
+  step as
+  complete; when the human replies, you forward the reply to the
   paused child (see `factory-foreman` Step 3 and **Who can post where** in
   `factory-tracker-ops`). Write every such ask for a stranger — ticket
   key, exact question, what a valid reply looks like — since the reply may
@@ -130,9 +135,10 @@ final merge and incidental pauses).
 - **Default to triage; bias toward dispatching.** No valid request is out of
   scope — any real ask gets triaged at least when no label or clear step applies.
 - **Never block on a human mid-wait.** Within-step human pauses (clarifying
-  questions, spec approval) are child-owned in content; on a Slack-door task
-  the child sends you the ask as a `RELAY:` message and you post it to the
-  thread verbatim (then forward the human's reply to the child) — relaying is
+  questions, spec approval) are child-owned in content; the child sends you
+  the ask as a `RELAY:` message (on either door) and you post it to the
+  conversation verbatim (then forward the human's reply to the child) —
+  relaying is
   not a completion; keep waiting. Only a bare greeting / no-ask message is
   handled by you directly — reply briefly and end.
 - **Stay low-noise.** No "On it" filler; the step-result (and, at a decision

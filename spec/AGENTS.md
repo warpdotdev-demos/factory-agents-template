@@ -20,13 +20,16 @@ foreman never asks before starting implementation — and end.
 **The approval gate is configurable.** Read `spec_approval_required` from
 `foreman/config.json`. When `true` (the default), apply `spec-done` only after
 a human approves the spec — approval comes from the task's conversation channel
-(the Slack thread for a Slack-triggered task; a Jira comment reply for a
+(the Slack thread for a Slack-triggered task; a reply to the Warp app's
+ticket comment for a
 Jira-triggered task — see the door-dependent doctrine in
-`factory-tracker-ops`). **You cannot post to a Slack thread yourself** — on a
-Slack-door task, deliver the approval ask to the foreman as a `RELAY:` message
-(the exact Slack-mrkdwn text to post) and it posts the ask and forwards the
-reply back to you (see **Who can post where** in `factory-tracker-ops`); on a
-Jira-door task, post the Jira comment yourself. The approval wait itself is a
+`factory-tracker-ops`). **You cannot post to the conversation yourself on
+either door** — deliver the approval ask to the foreman as a `RELAY:` message
+(the exact text to post — Slack mrkdwn on the Slack door, plain markdown on
+the Jira door) and it posts the ask and forwards the
+reply back to you (see **Who can post where** in `factory-tracker-ops`); never
+post the ask as a service-account Jira comment, whose replies are not routed
+to the factory. The approval wait itself is a
 within-step pause — don't send the foreman a completion message until the
 spec is approved and labeled (the `RELAY:` delivery request is not a
 completion). When
@@ -80,8 +83,8 @@ source of truth for the spec:** because the committed spec can be edited
 directly by a human on the PR, any rework re-reads the committed spec from the
 branch and reads any comments left on it before revising. The implementation
 and review agents read the spec from that committed file. When approval is
-required, it comes from the task's conversation channel (on a Slack-door task,
-never from a ticket comment).
+required, it comes from the task's conversation channel (never from a reply
+to a service-account ticket comment — those are not routed to the factory).
 
 ## Mechanics
 Deterministic helpers live in `scripts/` at the repo root. For a **bug**,

@@ -23,8 +23,9 @@ as `--email`, plus `--repo <owner/repo>`.
 
 If the script prints nothing (it never guesses) or you otherwise can't
 confidently resolve them, ask one concise clarifying question in the task's
-conversation channel (tag the requester; on a Slack-door task deliver it via a
-`RELAY:` message to the foreman — you cannot post to the thread yourself — per
+conversation channel (tag the requester; deliver it via a
+`RELAY:` message to the foreman on either door — you cannot post to the
+conversation yourself — per
 the door-dependent doctrine and **Who can post where** in
 `factory-tracker-ops`) and end your turn.
 
@@ -45,8 +46,11 @@ to *add* a reviewer rather than *replace* — honor what was asked).
 
 ## Step 3 — Notify
 
-Post a reply on the task's record via `factory-tracker-ops`, tagging the **new**
-reviewer so they know it's on them:
+Notify the task, tagging the **new**
+reviewer so they know it's on them — on a Slack-door task as a record comment
+via `factory-tracker-ops`; on a Jira-door task in your report to the foreman
+(no service-account comment — the foreman's response reaches the ticket via
+the Warp app):
 
 > Updated — review reassigned to <@new-reviewer>: <PR URL>.
 

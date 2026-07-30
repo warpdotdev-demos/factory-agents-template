@@ -128,8 +128,11 @@ rendered surface, not a mockup or static image from design.
 
 Visual proof is only useful if the reviewer and the requester can see it.
 
-1. **Task record.** Embed the screenshots or video link in a progress update via
-   `factory-tracker-ops` so the record carries the visual evidence.
+1. **Task record.** Surface the screenshots or video link per
+   `factory-tracker-ops` — on a Slack-door task embed them in a record comment
+   / progress update; on a Jira-door task include the proof links in your
+   completion report to the foreman (no service-account comment there — the
+   foreman's step result reaches the ticket via the Warp app).
 2. **PR body.** Embed the same proof in the final PR description so the reviewer
    sees the validated behavior without re-running anything.
 

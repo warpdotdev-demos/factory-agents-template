@@ -60,16 +60,21 @@ pipeline label.
 ## Step 1 — Scope the change and post a pre-confirm summary
 
 Self-edits change the agents' own behavior, so a human approves the **plan**
-before you write it. Record the change summary on the ticket for durability, and
-**request approval in the task's conversation channel**. On a Slack-triggered
-task you cannot post to the Slack thread yourself — only the foreman can — so
+before you write it. Record the change summary on the ticket for durability
+(a record comment on a Slack-door task; the issue description via
+`update-issue --append-description` on a Jira-door task — no service-account
+comments there), and
+**request approval in the task's conversation channel**. You cannot post to
+the conversation yourself on either door — only the foreman can — so
 send the foreman a `RELAY:` message (agent-to-agent, to your coordination
-footer's run id) whose body is the exact Slack-mrkdwn approval ask to post,
-and the foreman posts it verbatim and forwards the reply back to you (a ticket
-comment never wakes such a run). On a Jira-triggered task post the approval
-ask yourself as a Jira comment (per the door-dependent doctrine and **Who can
+footer's run id) whose body is the exact approval ask to post — Slack mrkdwn
+on a Slack-door task, plain markdown on a Jira-door task —
+and the foreman posts it verbatim and forwards the reply back to you. Never
+post the ask as a service-account Jira comment — replies to those are not
+routed to the factory (per the door-dependent doctrine and **Who can
 post where** in `factory-tracker-ops`). Tag the requester and ask them to
-reply **there**, writing the ask for a stranger — carry the ticket key, the
+reply **there** (in the conversation), writing the ask for a stranger — carry
+the ticket key, the
 ask, and what a valid reply looks like. The substantive full-detail summary
 includes these points.
 - What behavior/skill changes and why.
@@ -160,12 +165,17 @@ at PR-open (non-optional)** via the resolve → assign → fallback flow in
 `factory-github-ops` — run `scripts/factory-resolve-reviewer` (pass the
 requester's email or user id) then `gh pr edit --add-reviewer <handle>`; if no
 handle resolves, ask the requester for their GitHub username **in the task's
-conversation channel** (via the foreman `RELAY:` message on a Slack-door task,
-or a Jira comment you post yourself — see **Who can post where** in
+conversation channel** (via a `RELAY:` message to the foreman on either door —
+see **Who can post where** in
 `factory-tracker-ops`) and assign on resume, never guessing a handle. Complete
-by label via `factory-tracker-ops` — record the PR link on the ticket, remove
+by label via `factory-tracker-ops` — record the PR link on the ticket
+(attach-pr on both doors; the PR-link comment on a Slack-door task only),
+remove
 `spec-done`, add `impl-done`, keep the task **In Progress**, and post the
-PR-ready notification tagging the requester with the PR link and what changed.
+PR-ready notification tagging the requester with the PR link and what changed
+(a record comment on a Slack-door task; on a Jira-door task carry it in your
+completion report to the foreman — its step result reaches the ticket via the
+Warp app).
 
 Then **report completion to the foreman** (per the coordination footer in your
 brief) — send it a brief message with the PR link, status **In Progress**, the

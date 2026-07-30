@@ -1,6 +1,6 @@
 ---
 name: factory-tracker-ops
-description: Shared reference for how factory agents track and communicate work through the issue tracker — reading a task, creating a ticket, posting comments/updates, setting lifecycle status for the loop, and resolving a requester's identity. All tracker operations go through the `scripts/tracker` CLI (default provider `jira`), falling back to commenting on the PR or replying to the caller only when the tracker is unreachable. Use whenever any factory skill needs to read or update the task's record.
+description: Shared reference for how factory agents track and communicate work through the issue tracker — reading a task, creating a ticket, posting comments/updates, setting lifecycle status for the loop, and resolving a requester's identity. All tracker operations go through the `scripts/tracker` CLI (default provider `jira`), falling back to commenting on the PR or replying to the caller only when the tracker is unreachable. Service-account ticket comments are Slack-door-only and never solicit replies; on a Jira-door task the Warp app integrated with Jira mirrors the foreman's conversation onto the ticket, so agents post no service-account comments there. Use whenever any factory skill needs to read or update the task's record.
 ---
 
 # factory-tracker-ops
@@ -47,51 +47,88 @@ Factory agents work across **two channels**, and they are not interchangeable.
   enriched issue, the story-point estimate, the **spec PR link** (the spec
   itself lives as a committed file in that PR, never as a ticket comment),
   progress, artifacts (PR / review links), lifecycle status, and the pipeline
-  gate labels all live here. Keep writing them here.
+  gate labels all live here. Ticket **properties** — status, labels, estimate,
+  priority, `attach-pr` remote links, and description edits — are always
+  written via `scripts/tracker`, on **both** doors. Ticket **comments** are
+  door-scoped (below) — they are how agents document a Slack-door ticket, and
+  they are prohibited on a Jira-door ticket.
 - **The conversation — the channel that can wake the run.** A task's
   conversation channel is fixed at trigger time (the task's "door") and is
   recorded on the ticket by the foreman.
 
-The door determines where every gating ask goes.
+The door determines where every gating ask and update goes.
 - **Slack-triggered task.** The conversation is the Slack thread the request
   came from. Every ask that must be answered before the run can continue — a
   clarifying question, spec approval, the merge ask, or any `continue` prompt —
   goes **in that Slack thread** (posted by the **foreman**; child agents relay
   through it — see **Who can post where** below), and only a thread reply
-  wakes the run. The ticket stays **record-only** — a comment left on the
-  ticket never wakes a Slack-originated run. When an agent posts a ticket
-  comment on a Slack-door task, include a one-line pointer to the live Slack
-  thread so a reader of the ticket knows where the conversation is happening.
-- **Jira-triggered task.** The ticket **is** the conversation. Post gating asks
-  as **Jira comments** and the requester replies there — the Jira integration
-  routes ticket replies to the run, so a comment reply wakes it.
+  wakes the run. The ticket stays **record-only** — agents keep documenting
+  progress and artifacts there as service-account comments
+  (`scripts/tracker comment`), but a ticket comment never wakes a
+  Slack-originated run — so every record comment includes a one-line pointer
+  to the live Slack thread and **never asks for a reply** (see
+  **Service-account comments never solicit replies** below).
+- **Jira-triggered task.** The ticket's comment thread is the conversation —
+  but it is carried by the **Warp app integrated with Jira**, not by the
+  service account. The Warp app mirrors the foreman run's responses onto the
+  ticket and routes replies to the Warp app's comments back to the run.
+  Because the Warp app already posts the run's updates, agents must **not**
+  post ticket comments via `scripts/tracker comment` on a Jira-door task — a
+  service-account comment duplicates the Warp app's update, and a reply to a
+  service-account comment is not routed to the factory. The foreman delivers
+  every ask, dispatch notification, and step result as its **own
+  conversation response** (the Warp app surfaces it on the ticket); children
+  deliver theirs through the foreman as `RELAY:` messages (see **Who can
+  post where** below). Ticket properties (status, labels, estimate, remote
+  links, description edits) are still written via `scripts/tracker`.
 
 ### Who can post where (capability rule)
 
-The two doors have different reach for different agents.
-- **Only the foreman can post to the chat thread.** The Slack integration is
-  bound to the foreman run alone — child agents (triage, spec, implementation,
-  code-review) have **no way** to post into the Slack thread and must never
-  attempt to (no hunting for Slack tools, webhooks, or credentials). On a
-  Slack-door task, a child delivers a gating ask by **relaying it through the
-  foreman** — send the foreman (the run id in your brief's coordination footer)
-  an agent-to-agent message with the subject prefixed `RELAY:` and a body
-  containing the exact, ready-to-post Slack-mrkdwn text of the ask (written
-  for a stranger), then end the turn. The foreman posts that text to the
-  thread verbatim. The human's thread reply wakes the **foreman**, which
+Only the **foreman** can post to a task's conversation channel — on **both**
+doors.
+- **Slack door.** The Slack integration is bound to the foreman run alone —
+  child agents (triage, spec, implementation, code-review) have **no way** to
+  post into the Slack thread and must never attempt to (no hunting for Slack
+  tools, webhooks, or credentials).
+- **Jira door.** The ticket conversation is the Warp app mirroring the
+  **foreman's** conversation. A child's service-account comment would
+  duplicate the Warp app's updates and could never receive a working reply,
+  so children never post ticket comments on a Jira-door task either.
+- **How a child delivers an ask (both doors).** A child delivers a gating ask
+  by **relaying it through the foreman** — send the foreman (the run id in
+  your brief's coordination footer) an agent-to-agent message with the subject
+  prefixed `RELAY:` and a body containing the exact, ready-to-post text of
+  the ask (written for a stranger) — Slack mrkdwn on a Slack-door task, plain
+  markdown on a Jira-door task — then end the turn. The foreman posts that
+  text to the conversation verbatim — into the Slack thread on the Slack door,
+  or as its own conversation response on the Jira door (never via
+  `scripts/tracker comment`). The human's reply wakes the **foreman**, which
   forwards it verbatim to the paused child — that forwarded message is what
   resumes the child.
-- **Any agent can post a Jira comment.** Children carry tracker credentials,
-  so on a Jira-door task they post gating asks themselves via
-  `scripts/tracker comment` — no relay needed.
-- **Fallback.** If agent-to-agent messaging is unavailable on a Slack-door
-  task, post the ask as a ticket comment noting the conversation channel was
-  unreachable, and end — degraded but never stuck. Never spin trying to reach
-  a channel you cannot post to.
+- **Fallback.** If agent-to-agent messaging is unavailable, record the ask's
+  durable content on the ticket and end — degraded but never stuck. On a
+  Slack-door task that record may be a ticket comment noting the conversation
+  channel was unreachable (still never soliciting a reply); on a Jira-door
+  task append it to the ticket description
+  (`scripts/tracker update-issue <KEY> --append-description ...`) instead of
+  commenting. Never spin trying to reach a channel you cannot post to.
 
 A `RELAY:` message is **not** a completion report — the step is still
 incomplete and the foreman keeps waiting for it (see the completion report
 contract below).
+
+### Service-account comments never solicit replies (hard rule)
+
+Every comment posted through `scripts/tracker comment` / `update-comment` is
+authored by the **service account**, and a reply to a service-account comment
+is **not** routed to the factory — nothing happens. So no service-account
+comment may ever instruct the reader to reply to it (or to "reply on this
+ticket") to approve, continue, or kick off any action. Record comments state
+facts and link out; on a Slack-door task they point to the live Slack thread
+where replies actually work. Reply instructions belong only in the
+conversation channel — the foreman-posted Slack thread message, or the
+foreman's own conversation response on the Jira door (mirrored by the Warp
+app, whose comments do route replies back to the run).
 
 **Write every gate ask for a stranger.** A reply may cold-start a **fresh** run
 that re-derives all state from the ticket, so the ask itself must carry the
@@ -179,23 +216,29 @@ config. Do every read and mutation through these subcommands.
   skeleton); omit it to use the project default. Pass `--estimate` for the
   story-points value (XS=1, S=2, M=3, L=5, XL=8) — the provider writes it to
   the Jira field named by config `tracker.story_points_field`.
-- **Comment** with `scripts/tracker comment --issue <KEY> --body ...` to post
-  clarifying questions (Jira-door tasks), progress, or PR notifications. This
-  is how **every agent except triage** records updates on the issue (triage
-  appends to the description instead — see **Where triage records updates**
-  below). Write comment bodies in plain markdown — the tracker CLI converts
-  markdown to Jira's ADF format.
+- **Comment** with `scripts/tracker comment --issue <KEY> --body ...` to
+  record progress or artifacts on the ticket — **on Slack-door tasks only**.
+  The comment is posted by the **service account**, so it must never solicit
+  a reply (see **Service-account comments never solicit replies** above), and
+  on a Jira-door task it is prohibited outright — the Warp app already posts
+  the run's updates there (see the door doctrine above). On a Slack-door
+  task this is how **every agent except triage** records updates on the issue
+  (triage appends to the description instead — see **Where triage records
+  updates** below). Write comment bodies in plain markdown — the tracker CLI
+  converts markdown (including single line breaks) to Jira's ADF format.
 - **Attach a PR** to the ticket with
   `scripts/tracker attach-pr --issue <KEY> --url <github-pr-url> --title "PR #<N>: <short description>"`.
   It creates a **Jira remote link** on the issue. Use this whenever a PR is
-  opened for the task, in addition to posting a comment with the link.
+  opened for the task, on **both** doors (on a Slack-door task, also post the
+  comment with the link per the completion report contract below).
 - **Set or append the description** with
   `scripts/tracker update-issue <KEY> [--append-description ...] [--description ...]`
   to record information in the issue **body**. `--append-description` adds
   text after the existing body (separated by a blank line); `--description`
   replaces it wholesale (the two are mutually exclusive). **Triage** uses
   `--append-description` to record its updates (reproduction proof, progress,
-  the enriched template) instead of commenting; other agents keep commenting.
+  the enriched template) instead of commenting; other agents comment — on
+  Slack-door tasks only.
 - **Set the actual status, estimate, and/or labels** with
   `scripts/tracker update-issue <KEY> [--status "<state>"] [--estimate <n>] [--add-label <name> ...] [--remove-label <name> ...]`
   to track the lifecycle (see **Lifecycle status**) and record step completion
@@ -340,22 +383,24 @@ completed state, (2) set its required ticket status/estimate signal when it
 owns one, and (3) **recorded the artifacts it produced on the ticket** (for
 example, the enriched issue + story-point estimate from triage, the spec PR
 link from spec, the PR link, or the review link). **Every PR-opening step (spec
-and implementation) must both attach the PR to the ticket AND comment the PR
-link, before applying the gate label.**
-1. `scripts/tracker attach-pr --issue <KEY> --url <pr-url> --title "PR #<N>: <short description>"` — creates a Jira remote link on the issue.
-2. `scripts/tracker comment --issue <KEY> --body "PR: <pr-url>"` — records the link in the comment feed.
+and implementation) must attach the PR to the ticket before applying the gate
+label — and on a Slack-door task also comment the PR link.**
+1. `scripts/tracker attach-pr --issue <KEY> --url <pr-url> --title "PR #<N>: <short description>"` — creates a Jira remote link on the issue (both doors).
+2. **Slack door only** — `scripts/tracker comment --issue <KEY> --body "PR: <pr-url>"` records the link in the comment feed. On a Jira-door task skip this comment — the foreman's step result (mirrored to the ticket by the Warp app) carries the PR link.
 
-The review step must similarly post the review link as a comment. After all
+The review step similarly posts the review link as a comment on a Slack-door
+task only; on the Jira door the verdict and review link reach the ticket via
+the foreman's step result. After all
 required signals are present, the step also sends the **foreman** a brief
 completion message — the result, artifact links, status/estimate signal, and
 applied label — per the coordination footer in its dispatch brief.
 
 Do not send the foreman a **completion** message before the step is actually
 complete. A within-step human pause, such as a clarifying question or spec
-approval request, is not a completion — on a Slack-door task deliver that ask
+approval request, is not a completion — deliver that ask
 to the foreman as a `RELAY:` message instead (see **Who can post where**
-above), which the foreman posts to the thread without treating the step as
-done. If agent-to-agent messaging is unavailable, finish the local label and
+above), which the foreman posts to the conversation without treating the step
+as done. If agent-to-agent messaging is unavailable, finish the local label and
 artifact updates and end; the durable ticket state remains the source of
 truth.
 
@@ -380,8 +425,9 @@ created on first use, so a "missing" gate label in the workspace is not a
 blocker — applying it creates it.
 
 ### Canonical wrong-label message
-When an issue reaches a step agent without that agent's gate label, post
-exactly this (filled in) and end the turn.
+When an issue reaches a step agent without that agent's gate label, deliver
+exactly this (filled in) per **Who can post where** above — a child agent
+sends it to the foreman as a `RELAY:` message — and end the turn.
 
 > Skipping — <ticket key> isn't gated for *<this stage>* yet. It carries
 > `<current label, or "no pipeline label">`, not `<required label>`. Re-apply
@@ -394,8 +440,9 @@ receives a new request with no existing ticket, it creates a skeleton issue via
 `scripts/tracker create-issue` — a concise title, a brief description from the
 request, and status **In Progress** (no gate label; triage seeds the first
 one). The foreman also records the task's **door** (the Slack thread link for a
-Slack-triggered task, or a note that the ticket itself is the conversation for
-a Jira-triggered one) in the ticket description. The ticket is then passed to
+Slack-triggered task, or a note that the ticket conversation — carried by the
+Warp app mirroring the foreman's run — is the channel for a Jira-triggered
+one) in the ticket description. The ticket is then passed to
 the appropriate child agent via `task_id` in the brief, or via
 `send_message_to_agent` in the parallel-dispatch path.
 
@@ -477,10 +524,15 @@ tickets use the `self_project` placement above.
 ## Communicating well
 
 Defer to `factory-progress-updates` for **what** to post and how terse to be.
-This skill is the **how**. The default channel for recording an update on the
-ticket is a **comment** (`scripts/tracker comment`); fall back to a PR comment
-or a direct reply when the tracker is unreachable. Tag the requester on
-substantive updates (clarifying questions, specs, PR-ready notifications).
+This skill is the **how**. Where an update lands is door-scoped — on a
+**Slack-door** task, record updates on the ticket as service-account comments
+(`scripts/tracker comment`) and put anything conversational in the Slack
+thread (via the foreman); on a **Jira-door** task, post no service-account
+comments — updates reach the ticket through the foreman's own conversation
+responses (mirrored by the Warp app), and child agents report to the foreman
+instead of commenting. Fall back to a PR comment or a direct reply when the
+tracker is unreachable. Tag the requester on substantive updates (clarifying
+questions, specs, PR-ready notifications).
 
 **Tag people with real mentions, formatted by platform.** Slack mention syntax
 (`<@USERID>`) is not valid in Jira — it renders as literal text and notifies
@@ -504,23 +556,29 @@ Never post probe/test chatter to a customer-visible record — write the real
 update once.
 
 Format by door, per the formatting policy in `factory-progress-updates`.
-- **Slack-door messages** (posted to the Slack thread) — author in Slack
-  mrkdwn. Slack renders its own mrkdwn, not CommonMark, so CommonMark bold,
-  headers, or `[text](url)` links render as literal punctuation.
-- **Jira-door comments** (posted via `scripts/tracker comment`) — write plain
-  markdown; the tracker CLI converts it to ADF.
+- **Slack-door thread messages** (posted to the Slack thread) — author in
+  Slack mrkdwn. Slack renders its own mrkdwn, not CommonMark, so CommonMark
+  bold, headers, or `[text](url)` links render as literal punctuation.
+- **Slack-door record comments and descriptions** (written via
+  `scripts/tracker comment` / `update-issue`) — plain markdown; the tracker
+  CLI converts it to ADF (single newlines render as real line breaks).
+- **Jira-door conversation messages** (the foreman's own responses, mirrored
+  to the ticket by the Warp app, and the `RELAY:` bodies children send for
+  them) — plain markdown, never Slack mrkdwn.
 
 ### Where triage records updates
 **Triage is the exception.** Instead of adding comments, the triage agent
 records its updates by **appending to the issue's description**
 (`scripts/tracker update-issue <KEY> --append-description ...`) — its findings,
 reproduction proof, progress notes, and the enriched 6-section template all
-live in the issue **body**. Every **other** agent (spec, implementation,
-code-review, foreman) continues to record updates as **comments**. This keeps
+live in the issue **body**, on both doors. Every **other** agent (spec,
+implementation, code-review, foreman) records updates as **comments** on
+Slack-door tasks (on a Jira-door task nobody posts service-account comments —
+see the door doctrine above). This keeps
 the triage deliverable consolidated in one place (the description) while later
 discussion stays in the comment thread. Lifecycle status, estimate, and
 pipeline gate labels are still set on the ticket's real properties via
-`update-issue` regardless of agent.
+`update-issue` regardless of agent or door.
 
 ## The "wait for a human" pattern
 
@@ -529,23 +587,26 @@ clarifying question, spec approval, merge ask, or any `continue`), do this.
 1. **Deliver the ask to the task's conversation channel, by role and door**
    (see **Who can post where** above).
    - **Foreman** — post it directly in the Slack thread on a Slack-door task,
-     or as a Jira comment on a Jira-door task.
-   - **Child agent, Slack door** — you cannot post to the thread; send the
-     foreman a `RELAY:` message carrying the exact Slack-mrkdwn text to post,
-     and the foreman posts it verbatim.
-   - **Child agent, Jira door** — post the Jira comment yourself via
-     `scripts/tracker comment`.
-   Whoever authors it, tag the relevant person, tell them to reply there, and
-   write the ask **for a stranger** — include the ticket key, the exact
+     or as your own conversation response on a Jira-door task (the Warp app
+     mirrors it to the ticket; never post the ask via
+     `scripts/tracker comment` — a reply to a service-account comment is not
+     routed to the factory).
+   - **Child agent (either door)** — you cannot post to the conversation; send
+     the foreman a `RELAY:` message carrying the exact text to post (Slack
+     mrkdwn on a Slack-door task, plain markdown on a Jira-door task), and
+     the foreman posts it verbatim.
+   Whoever authors it, tag the relevant person, tell them to reply in the
+   conversation (never "reply to this comment" on a service-account comment),
+   and write the ask **for a stranger** — include the ticket key, the exact
    question, and what a valid reply looks like, because the reply may
    cold-start a fresh run that re-derives all state from the ticket. On a
    Slack-door task, never depend on a ticket comment to resume the workflow;
    record the durable content the ask refers to (e.g. the spec PR link) on
    the ticket, but put the request-for-a-reply itself in the thread (via the
    relay when you are a child).
-2. **End your turn.** The reply resumes the run later — a ticket comment wakes
-   the run on the Jira door; on the Slack door the thread reply wakes the
-   **foreman**, which forwards it to the paused child when the ask was a
-   child's relayed ask. Either way, the agent re-derives external state from
-   the task record + `scripts/factory-state`.
+2. **End your turn.** The reply resumes the run later — on the Jira door a
+   reply to the Warp app's comment wakes the run; on the Slack door the
+   thread reply wakes the **foreman**, which forwards it to the paused child
+   when the ask was a child's relayed ask. Either way, the agent re-derives
+   external state from the task record + `scripts/factory-state`.
 Don't poll in a loop waiting — it wastes the run.
