@@ -1,3 +1,6 @@
 {"id": "triage-settings-500", "prompt": "Users report the settings page returns a 500 error when the profile has no avatar image. Triage this report."}
 {"id": "triage-search-case", "prompt": "Search results miss items whose titles differ only by letter case; users expect case-insensitive search. Triage this report."}
 {"id": "triage-export-feature", "prompt": "Feature request: allow exporting a user's data as CSV from the account page. Triage this request."}
+{"id": "triage-routing-clear-owner", "prompt": "Refunds issued from the admin console are recorded twice in the ledger, so the daily payout total is wrong. Triage this report."}
+{"id": "triage-routing-near-miss", "prompt": "The results page shows a stale total after a refund is issued, so the two screens disagree. Triage this report and be explicit about which repo owns the fix."}
+{"id": "triage-routing-shared-repo", "prompt": "The checkout button is unreadable in dark mode on the shared web app. Triage this report."}

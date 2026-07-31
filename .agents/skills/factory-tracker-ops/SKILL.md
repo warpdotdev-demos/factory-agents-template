@@ -134,7 +134,9 @@ dispatching a child, in this order.
 3. **Find an existing one (search before creating).** If none was provided,
    look for an existing open ticket
    (`scripts/tracker search-issues "<keywords>"`) **before** creating anything,
-   and adopt a clear match rather than minting a duplicate.
+   and adopt a clear match rather than minting a duplicate. The search spans
+   every routed project by default, so a duplicate someone filed in a different
+   team's project still surfaces.
 4. **Create a skeleton.** Only when the search above turns up no match, create
    one from the issue template below with no gate label (triage seeds the
    first one) and status **In Progress**. Use the new ticket's key as `task_id`
@@ -168,17 +170,22 @@ config. Do every read and mutation through these subcommands.
   spec.
 - **Search** for an existing ticket with
   `scripts/tracker search-issues "<keywords>"` (open issues, for
-  deduplication / ensure-ticket).
+  deduplication / ensure-ticket). With no `--team` it searches **every** routed
+  project, so a duplicate filed in another team's project is still found; pass
+  `--team <PROJECTKEY>` (repeatable) to scope the search when you already know
+  where the work belongs.
 - **Create** an issue with
   `scripts/tracker create-issue --title ... --description ... --team "<PROJECTKEY>" [--labels ...] [--status "<state>"] [--estimate <n>]`.
-  `--team` is the **Jira project key** — pick it by routing area (see **Project
-  routing** below); omit it only to fall back to the config's
-  `tracker.default_project`. The issue type comes from config
-  `tracker.issue_type`. Pass `--status` to set the initial lifecycle state on
-  creation (e.g. `Triage` for triage intake, `In Progress` for a foreman
-  skeleton); omit it to use the project default. Pass `--estimate` for the
-  story-points value (XS=1, S=2, M=3, L=5, XL=8) — the provider writes it to
-  the Jira field named by config `tracker.story_points_field`.
+  `--team` is the **Jira project key** — pick it by routing area (see
+  **Routing, in two stages** below); omit it only to fall back to the config's
+  `tracker.default_project`. The issue type comes from that project's
+  `issue_type` override when it has one, else config `tracker.issue_type`.
+  Pass `--status` to set the initial lifecycle state on creation (e.g.
+  `Triage` for triage intake, `In Progress` for a foreman skeleton); omit it to
+  use the project default. Pass `--estimate` for the story-points value (XS=1,
+  S=2, M=3, L=5, XL=8) — the provider writes it to that project's story-points
+  field (its own `story_points_field` override when it has one, else config
+  `tracker.story_points_field`).
 - **Comment** with `scripts/tracker comment --issue <KEY> --body ...` to post
   clarifying questions (Jira-door tasks), progress, or PR notifications. This
   is how **every agent except triage** records updates on the issue (triage
@@ -239,11 +246,12 @@ The loop tracks a single lifecycle state for the task, mirrored to the ticket's
 **status**. The factory uses six canonical state names — **Triage, Todo, In
 Progress, In Review, Done, Canceled** — and the config map
 `tracker.status_map` in `foreman/config.json` maps each one to the customer's
-real Jira status name. Pass the factory state name to
-`scripts/tracker update-issue <KEY> --status "<state>"`; the provider applies
-the mapped Jira status. This status is one of the durable completion signals
-the foreman verifies alongside the gate label and produced artifacts. The
-states are these.
+real Jira status name, with any per-project `status_map` override applied on top
+for that project's own tickets. Pass the factory state name to
+`scripts/tracker update-issue <KEY> --status "<state>"`; the provider resolves
+the issue's project from its key and applies the mapped Jira status. This
+status is one of the durable completion signals the foreman verifies alongside
+the gate label and produced artifacts. The states are these.
 - **Triage** — triage owns the ticket and is clarifying/reproducing/sizing it.
 - **Todo** — triage finished. The issue is enriched and has a story-point
   estimate.
@@ -420,8 +428,8 @@ a second issue.
 - **Testing** — how the fix is verified. The deterministic check per
   `factory-verification` — a regression test per the target repo's
   `test_guidance` that fails before / passes after, plus that repo's
-  validation gate (its `validate_command`), both read from the repo's entry in
-  config `target_repos`.
+  validation gate (its `validate_command`), both read from that repo's settings
+  via `scripts/factory-config repo --repo <org/repo>`.
 - **Solution** — the fix direction. For an obvious fix, the concrete change;
   for a non-obvious one, a proposed direction/hypothesis the spec will
   elaborate.
@@ -440,15 +448,35 @@ If the priority or categorization label can't be set (missing in the workspace,
 or the CLI can't set it), proceed anyway and note on the issue that the field
 couldn't be set.
 
-### Project routing (by area)
-Every factory issue is created in the Jira **project** whose area the change
-falls under. The routing table and the fallback are declared in
-`foreman/config.json`.
-- `tracker.project_routing` — a map of Jira project key → the area it owns
-  (e.g. backend services vs. the web app). Pick the project key whose
-  configured area matches the change and pass it via `--team`.
-- `tracker.default_project` — the fallback project key when no routing area
-  clearly applies.
+### Routing, in two stages (project, then repo)
+Routing happens in **two stages**, and the first narrows the second. Read both
+from the resolver `scripts/factory-config` instead of parsing
+`foreman/config.json` by hand — at many projects and many repos, hand-reading
+the whole config is how a ticket ends up pointed at another team's repo.
+1. **The Jira project.** Every factory issue is created in the project whose
+   area the change falls under. `scripts/factory-config projects` lists each
+   routed project key with the area it owns (config `tracker.project_routing`)
+   plus the `tracker.default_project` fallback. Pick the key whose area matches
+   the change and pass it via `--team`. An **existing** ticket has already
+   answered this stage, because its key prefix *is* the project — `PAY-123`
+   lives in `PAY`.
+2. **The target repo, within that project's repos.** A project normally owns
+   only some of the repos, so a ticket's candidates are just that project's
+   subset. `scripts/factory-config repos --issue <ticket key>` (or
+   `--key <PROJECTKEY>`) prints exactly those candidates with their
+   descriptions and that project's `default_repo` fallback. Which candidate
+   fits is `factory-triage`'s judgment; the narrowing is not, so never widen it
+   back out to every configured repo. A project that declares no subset leaves
+   every target repo a candidate, which is the single-project shape.
+
+**Per-project tracker settings.** Multi-project sites rarely share one
+workflow. A project entry may override `status_map`, `story_points_field`,
+`issue_type`, and `spec_approval_required`, and `scripts/tracker` applies the
+right project's override automatically for every read and write (it derives the
+project from `--team`, or from the issue key on `get-issue` / `update-issue`).
+So pass factory state names as usual, and when you need to know the effective
+values, read them with `scripts/factory-config project --issue <ticket key>`.
+Never assume one project's status names hold for another.
 
 **Self-related issues (special case).** Self-skills changes — changes to the
 agents' own playbook/skills — and any ticket created by the foreman or

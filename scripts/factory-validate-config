@@ -16,9 +16,17 @@ Checks, in order:
     status_map covering all six factory states, issue_type; story_points_field
     string/null; optional browse_url), a non-empty `target_repos` map whose
     entries carry description/base_branch/validate_command/test_guidance
-    (optional app_start_command/app_url; unknown fields warn),
-    `default_target_repo` inside target_repos, boolean
+    (optional app_start_command/app_url/environment_id/runner_id; unknown
+    fields warn), `default_target_repo` inside target_repos, boolean
     `spec_approval_required`, and `self_repo`/`self_project`;
+  * project -> repo routing: a `project_routing` value may be a plain
+    description string (every target repo is a candidate) or an object that
+    declares the project's repo SUBSET (`repos`, `default_repo`) plus optional
+    per-project tracker overrides (`status_map`, `story_points_field`,
+    `issue_type`, `spec_approval_required`, `environment_id`, `runner_id`).
+    Every referenced repo must exist in `target_repos`, each `default_repo`
+    must be inside its own project's subset, and a target repo no project can
+    reach is warned about (it would be unroutable);
   * each track config has agent.entrypoint_skill, a plain string model, and
     repos.self;
   * cross-file consistency: every track's repos.self equals the foreman's
@@ -57,7 +65,24 @@ TARGET_REPO_REQUIRED_FIELDS = (
     "validate_command",
     "test_guidance",
 )
-TARGET_REPO_OPTIONAL_FIELDS = ("app_start_command", "app_url")
+TARGET_REPO_OPTIONAL_FIELDS = (
+    "app_start_command",
+    "app_url",
+    "environment_id",
+    "runner_id",
+)
+# Keys allowed on the object form of a `tracker.project_routing` value.
+PROJECT_REQUIRED_FIELDS = ("description",)
+PROJECT_OPTIONAL_FIELDS = (
+    "repos",
+    "default_repo",
+    "status_map",
+    "story_points_field",
+    "issue_type",
+    "spec_approval_required",
+    "environment_id",
+    "runner_id",
+)
 
 
 def has_placeholder(value):
@@ -100,7 +125,122 @@ def require_str(obj, key, where, errors, allow_none=False):
     return val
 
 
+def validate_project_routing(tracker, where, errors, warnings):
+    """Validate `project_routing` values (string or object); return entries.
+
+    A value may be a plain description string (the single-project shape the
+    template ships with, where every target repo stays a candidate) or an
+    object declaring the project's repo subset plus per-project tracker
+    overrides. Repo references are checked later, once `target_repos` is known.
+    """
+    routing = tracker.get("project_routing")
+    if not isinstance(routing, dict) or not routing:
+        errors.append(f"{where}: `project_routing` must be a non-empty map of "
+                      "project key -> description (or -> a project object)")
+        return {}
+
+    entries = {}
+    for key, value in routing.items():
+        loc = f"{where}: project_routing[{key!r}]"
+        if not isinstance(key, str) or not key:
+            errors.append(f"{loc}: project key must be a non-empty string")
+            continue
+        if isinstance(value, str):
+            if not value:
+                errors.append(f"{loc}: description must be a non-empty string")
+            entries[key] = {"repos": [], "default_repo": None}
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"{loc}: must be a description string or an object")
+            continue
+
+        require_str(value, "description", loc, errors)
+        repos = value.get("repos")
+        if "repos" in value:
+            if (not isinstance(repos, list) or not repos
+                    or not all(isinstance(r, str) and r for r in repos)):
+                errors.append(f"{loc}: `repos` must be a non-empty list of "
+                              "org/repo strings")
+            repos = [r for r in repos if isinstance(r, str) and r] \
+                if isinstance(repos, list) else []
+        else:
+            repos = []
+        if "default_repo" in value:
+            require_str(value, "default_repo", loc, errors)
+        if "status_map" in value:
+            status_map = value.get("status_map")
+            if not isinstance(status_map, dict) or not status_map:
+                errors.append(f"{loc}: `status_map` must be a non-empty object "
+                              "of factory state -> Jira status name")
+            else:
+                for state, mapped in status_map.items():
+                    if state not in FACTORY_STATES:
+                        errors.append(f"{loc}: `status_map` has unknown factory "
+                                      f"state {state!r}")
+                    elif not isinstance(mapped, str) or not mapped:
+                        errors.append(f"{loc}: `status_map[{state!r}]` must be a "
+                                      "non-empty string")
+        if "story_points_field" in value:
+            spf = value.get("story_points_field")
+            if spf is not None and (not isinstance(spf, str) or not spf):
+                errors.append(f"{loc}: `story_points_field` must be a non-empty "
+                              "string or null")
+        if "issue_type" in value:
+            require_str(value, "issue_type", loc, errors)
+        if "spec_approval_required" in value and not isinstance(
+                value["spec_approval_required"], bool):
+            errors.append(f"{loc}: `spec_approval_required` must be a boolean")
+        for field in ("environment_id", "runner_id"):
+            if field in value:
+                require_str(value, field, loc, errors)
+        for field in value:
+            if field not in PROJECT_REQUIRED_FIELDS + PROJECT_OPTIONAL_FIELDS:
+                warnings.append(f"{loc}: unknown field {field!r}")
+        entries[key] = {"repos": repos, "default_repo": value.get("default_repo")}
+    return entries
+
+
+def validate_routing_references(projects, target_repos, path, errors, warnings):
+    """Every project -> repo reference resolves, and every repo is routable."""
+    if not projects or not target_repos:
+        return
+    scoped = {key: entry for key, entry in projects.items() if entry.get("repos")}
+
+    for key, entry in projects.items():
+        loc = f"{path}: tracker.project_routing[{key!r}]"
+        for repo in entry.get("repos") or []:
+            if repo not in target_repos:
+                errors.append(f"{loc}: `repos` references {repo!r}, which is not "
+                              "a `target_repos` key")
+        default_repo = entry.get("default_repo")
+        if default_repo:
+            candidates = entry.get("repos") or list(target_repos)
+            if default_repo not in candidates:
+                errors.append(f"{loc}: `default_repo` {default_repo!r} is not one "
+                              "of that project's repos")
+
+    if scoped and len(scoped) == len(projects):
+        # Every project declares a subset, so an unreferenced repo is unroutable.
+        referenced = {repo for entry in scoped.values() for repo in entry["repos"]}
+        for repo in target_repos:
+            if repo not in referenced:
+                warnings.append(f"{path}: target repo {repo!r} is not listed under "
+                                "any `project_routing` project, so no ticket can "
+                                "route to it")
+    elif scoped:
+        unscoped = sorted(set(projects) - set(scoped))
+        warnings.append(f"{path}: project(s) " + ", ".join(unscoped)
+                        + " declare no `repos` subset, so every target repo stays "
+                        "a candidate for them; declare `repos` per project to keep "
+                        "routing scoped")
+    elif len(projects) > 1:
+        warnings.append(f"{path}: {len(projects)} projects are routed but none "
+                        "declares a `repos` subset, so every ticket may route to "
+                        "every target repo; add `repos` to each project entry")
+
+
 def validate_foreman(config, path, errors, warnings):
+    projects = {}
     tracker = config.get("tracker")
     if not isinstance(tracker, dict):
         errors.append(f"{path}: `tracker` must be an object")
@@ -114,17 +254,18 @@ def validate_foreman(config, path, errors, warnings):
         if spf is not None and (not isinstance(spf, str) or not spf):
             errors.append(f"{where}: `story_points_field` must be a non-empty "
                           "string or null")
-        routing = tracker.get("project_routing")
-        if (not isinstance(routing, dict) or not routing
-                or not all(isinstance(k, str) and isinstance(v, str) and k and v
-                           for k, v in routing.items())):
-            errors.append(f"{where}: `project_routing` must be a non-empty map "
-                          "of project key -> description")
-            routing = {}
+        projects = validate_project_routing(tracker, where, errors, warnings)
         default_project = require_str(tracker, "default_project", where, errors)
-        if default_project and routing and default_project not in routing:
+        if default_project and projects and default_project not in projects:
             errors.append(f"{where}: `default_project` {default_project!r} is "
                           "not a `project_routing` key")
+        self_project = config.get("self_project")
+        if (isinstance(self_project, str) and self_project and projects
+                and self_project not in projects
+                and PLACEHOLDER not in self_project):
+            warnings.append(f"{path}: `self_project` {self_project!r} is not a "
+                            "`project_routing` key; the factory's own tickets "
+                            "will use the site-wide tracker defaults")
         status_map = tracker.get("status_map")
         if not isinstance(status_map, dict):
             errors.append(f"{where}: `status_map` must be an object")
@@ -158,6 +299,8 @@ def validate_foreman(config, path, errors, warnings):
         for field in entry:
             if field not in TARGET_REPO_REQUIRED_FIELDS + TARGET_REPO_OPTIONAL_FIELDS:
                 warnings.append(f"{where}: unknown field {field!r}")
+
+    validate_routing_references(projects, target_repos, path, errors, warnings)
 
     default_target = require_str(config, "default_target_repo", path, errors)
     if default_target and target_repos and default_target not in target_repos:

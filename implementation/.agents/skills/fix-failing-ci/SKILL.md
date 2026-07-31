@@ -13,8 +13,10 @@ gate label — the PR stays `impl-done` throughout.
 
 Keep status posts terse per `factory-progress-updates`; read/post the task via
 `factory-tracker-ops` and use `factory-github-ops` for PR mechanics. The task's
-target repo is the repo recorded on the ticket; read its `validate_command`
-from its entry in `target_repos` in `foreman/config.json`.
+target repo is the repo recorded on the ticket (its `Target repo` line); read
+that repo's `validate_command` with
+`scripts/factory-config repo --repo <task's target repo>` rather than assuming a
+repo-wide gate — each target repo has its own.
 
 ## Step 0 — Find the PR and check the attempt budget
 
@@ -63,7 +65,7 @@ expand scope or refactor. Then re-run the full gate before pushing — the targe
 repo's validation gate:
 
 ```bash
-<the target repo's validate_command from its target_repos entry in foreman/config.json>
+<the target repo's validate_command, from scripts/factory-config repo --repo <task's target repo>>
 ```
 
 It must pass locally (exact checks depend on the repo's stack — consult the

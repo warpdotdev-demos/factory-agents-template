@@ -159,9 +159,12 @@ create the ticket:
    follow-up on — adopt it and do not create a duplicate.** Only when no match is
    found do you create a skeleton. Before calling `create-issue`:
    - **Resolve the project.** Apply the routing table from `factory-tracker-ops`
-     (read the `tracker.project_routing` map and `tracker.default_project`
-     fallback from `foreman/config.json`) to pick the Jira project key whose
-     area matches the request.
+     to pick the Jira project key whose area matches the request. List the
+     candidates with `scripts/factory-config projects` (each routed key, the
+     area it owns, the repos it owns, and the `default_project` fallback)
+     instead of reading `foreman/config.json` by hand. The project you pick also
+     narrows which repos triage may route to, so pick the owning team's project
+     rather than defaulting when the area is clear.
    - **Convert Slack mentions to Jira mentions before writing to Jira.** If
      the request arrived via Slack, the raw message may contain Slack mention
      tokens such as `<@U012ABCDEF>`. These tokens render as literal text in
@@ -262,11 +265,14 @@ Compose a tight prompt for the child run. Include:
   (per the door-dependent doctrine in `factory-tracker-ops`) and the PR-opening
   skills can include the originating thread in the PR body (see
   `factory-github-ops` PR body contents).
-- Context the child needs: the requester and the task's target repo — for a
-  target-repo change, the repo triage chose and recorded on the ticket, or,
-  when triage hasn't run yet, a note that triage will choose it from the
-  `target_repos` map in `foreman/config.json` (the template repo — config
-  `self_repo` — for self-skills changes).
+- Context the child needs: the requester, the task's **Jira project**, and the
+  task's **target repo** — for a target-repo change, the repo triage chose and
+  recorded on the ticket (its `Target repo` line), or, when triage hasn't run
+  yet, a note that triage will choose it from the repos that project owns
+  (`scripts/factory-config repos --issue <task_id>`) — the template repo (config
+  `self_repo`) for self-skills changes. Naming the repo matters beyond context
+  at many repos, because you also pass it to the dispatcher so the child lands
+  in that repo's environment (below).
   When the requester's identity is a Slack user ID (`<@USERID>`), resolve it
   via `scripts/reviewer_overrides.json`'s `slack_users` map and pass the child
   brief the person's display name **plus** their Jira accountId / mention
@@ -311,22 +317,37 @@ dispatch occurs even if several earlier steps (triage, spec) ran first.
 Dispatch is a **two-step** move — first *resolve* the child's `run_agents`
 parameters with the deterministic dispatcher, then *dispatch* by calling the
 `run_agents` tool with them. `factory-dispatch` resolves the track to its config
-(skill + model) + the shared environment and composes a ready-to-use `run_agents`
-payload; it makes **no** API call. The child executes as you (the `run_agents`
-tool links it to your run automatically) and reports completion back to you.
+(skill + model) + the environment/runner for the task's target repo and composes
+a ready-to-use `run_agents` payload; it makes **no** API call. The child executes
+as you (the `run_agents` tool links it to your run automatically) and reports
+completion back to you.
 
 Step A — **resolve** the payload:
 
 ```bash
 # No explicit model override:
 scripts/factory-dispatch --track <triage|spec|implementation|code-review> \
-  --prompt "<brief>" --parent-run-id "<your current run id>"
+  --prompt "<brief>" --parent-run-id "<your current run id>" \
+  --issue "<task_id>" [--repo "<task's target repo>"]
 
 # With a user-specified model override for this track:
 scripts/factory-dispatch --track <triage|spec|implementation|code-review> \
   --prompt "<brief>" --parent-run-id "<your current run id>" \
+  --issue "<task_id>" [--repo "<task's target repo>"] \
   --model "<user-specified model id>"
 ```
+
+**Always pass the routing context you have.** `--repo` (the target repo recorded
+on the ticket) and `--issue` (or `--project`) are how the dispatcher resolves
+which **cloud environment and runner** the child gets — a repo's own
+`environment_id`, else its project's, else the shared `$FACTORY_FOREMAN_ENV`.
+With many repos configured, one environment rarely carries every repo's
+toolchain, so a child dispatched without `--repo` can land somewhere its
+validation gate cannot run. Pass `--repo` for every step after triage has
+recorded the repo (spec, implementation, code-review, and any rework); pass
+`--issue` on the first triage dispatch, when the repo is not chosen yet. Check
+the emitted `environment_id` / `environment_source` if a child reports a missing
+toolchain.
 
 When the user's original message contains no explicit model reference for a
 given track, omit `--model` and let `factory-dispatch` resolve the model
@@ -581,7 +602,10 @@ incidental pauses (a clarifying question, or an exhausted rework budget):
   scripts/factory-pr-meta find --task-id <task_id> --repo <task's target repo>
   ```
   It returns `review_rework_attempts` (the number of rework cycles already run,
-  0 when none yet).
+  0 when none yet). Pass the recorded target repo rather than sweeping every
+  configured repo; when it is somehow missing, narrow with
+  `scripts/factory-state --task-id <task_id> --issue <task_id>`, which probes
+  only that project's repos.
   - **If `review_rework_attempts` < 3** ⇒ report changes requested, then loop
     straight back to Step 2 with `--track implementation` (passing the PR
     reference + a pointer to the review), and run Steps 3–5 for the rework. Do

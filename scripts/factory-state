@@ -21,8 +21,13 @@ Composed contracts (resolved from the sibling scripts in this same dir):
 
 The task's PR may live in any configured factory repo (one of the target repos,
 or this repo for self-skills changes — all read from foreman/config.json), so
-when --repo is omitted we probe every configured repo in order (a task maps to
+when --repo is omitted we probe every candidate repo in order (a task maps to
 at most one PR per repo).
+
+At many repos that fan-out gets expensive (one `gh` round trip per repo), so
+narrow it whenever you can: pass --repo with the task's recorded target repo
+(best), or --project / --issue to probe only the repos that Jira project owns
+(its `repos` subset in `tracker.project_routing`) plus `self_repo`.
 
 Fails loudly (nonzero exit + stderr) if any composed call fails, surfacing the
 underlying script's error output.
@@ -45,14 +50,41 @@ _FOREMAN_CONFIG = os.path.join(
 )
 
 
-def _configured_repos():
+def _load_foreman_config():
     try:
         with open(_FOREMAN_CONFIG, encoding="utf-8") as fh:
             config = json.load(fh)
     except (OSError, json.JSONDecodeError):
         config = {}
-    if not isinstance(config, dict):
-        config = {}
+    return config if isinstance(config, dict) else {}
+
+
+def _project_key_from_issue(issue_key):
+    """The Jira project key an issue key belongs to (PAY-123 -> PAY)."""
+    text = (issue_key or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        text = text.rsplit("-", 1)[0]
+    return text.strip().upper() or None
+
+
+def _project_repos(config, project):
+    """The repo subset a Jira project owns, or None when it declares none."""
+    if not project:
+        return None
+    tracker = config.get("tracker")
+    routing = tracker.get("project_routing") if isinstance(tracker, dict) else None
+    entry = routing.get(project) if isinstance(routing, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    repos = [r for r in (entry.get("repos") or []) if isinstance(r, str) and r]
+    return repos or None
+
+
+def _configured_repos(project=None):
+    """The repos to probe, narrowed to a project's subset when one is given."""
+    config = _load_foreman_config()
     repos = []
 
     def _add(value):
@@ -60,11 +92,16 @@ def _configured_repos():
             if value not in repos:
                 repos.append(value)
 
-    target_repos = config.get("target_repos")
-    if isinstance(target_repos, dict):
-        for key in target_repos:
+    scoped = _project_repos(config, project)
+    if scoped is not None:
+        for key in scoped:
             _add(key)
-    _add(config.get("target_repo"))  # legacy single-repo key
+    else:
+        target_repos = config.get("target_repos")
+        if isinstance(target_repos, dict):
+            for key in target_repos:
+                _add(key)
+        _add(config.get("target_repo"))  # legacy single-repo key
     _add(config.get("self_repo"))
     return tuple(repos)
 
@@ -144,9 +181,9 @@ def _pr_in_repo(task_id, repo):
     return pr
 
 
-def _pr_facts(task_id, repo):
+def _pr_facts(task_id, repo, project=None):
     """Probe the candidate repo(s) and return the first linked PR's facts."""
-    repos = (repo,) if repo else FACTORY_REPOS
+    repos = (repo,) if repo else _configured_repos(project)
     if not repos:
         _die(
             "no repos to probe: pass --repo, or set target_repos / self_repo in "
@@ -178,16 +215,32 @@ def main():
     parser.add_argument(
         "--repo",
         help=(
-            "Optional OWNER/REPO hint for the linked PR. When omitted, the "
-            "repos configured in foreman/config.json (target_repos, self_repo) "
-            "are probed."
+            "Optional OWNER/REPO hint for the linked PR (preferred: the task's "
+            "recorded target repo). When omitted, the repos configured in "
+            "foreman/config.json (target_repos, self_repo) are probed."
         ),
+    )
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--project",
+        metavar="PROJECTKEY",
+        help=(
+            "Narrow the probe to the repos this Jira project owns (its `repos` "
+            "subset in tracker.project_routing) plus self_repo. Ignored when "
+            "--repo is given."
+        ),
+    )
+    scope.add_argument(
+        "--issue",
+        metavar="ISSUEKEY",
+        help="Like --project, but the project is derived from an issue key.",
     )
     args = parser.parse_args()
 
+    project = (args.project or "").strip().upper() or _project_key_from_issue(args.issue)
     snapshot = {
         "task_id": args.task_id,
-        "pr": _pr_facts(args.task_id, args.repo),
+        "pr": _pr_facts(args.task_id, args.repo, project),
     }
     json.dump(snapshot, sys.stdout, indent=2)
     sys.stdout.write("\n")

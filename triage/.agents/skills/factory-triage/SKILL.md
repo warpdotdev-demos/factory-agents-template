@@ -71,8 +71,11 @@ you have a `task_id`:
 Once the `task_id` is in hand, read the task's externally-mutable facts:
 - **PR facts** via `scripts/factory-state` (a JSON snapshot keyed by task id):
   ```bash
-  scripts/factory-state --task-id <task_id> [--repo <owner/repo>]
+  scripts/factory-state --task-id <task_id> [--repo <owner/repo>] [--issue <task_id>]
   ```
+  Pass `--repo` when the ticket already records a target repo; otherwise pass
+  `--issue <task_id>` so the probe covers only the repos that ticket's Jira
+  project owns instead of every configured repo.
   It returns `{"task_id": ..., "pr": null | {url,number,repo,state,merged,mergedAt,reviewers}}`.
 - **Tracker facts** via `factory-tracker-ops` — the issue's current
   lifecycle status, **labels**, estimate, newest comment, and whether the latest
@@ -139,14 +142,27 @@ complexity` sizes them. The only out-of-scope case is a message with **no
 actionable ask** — pure banter, or a general question that asks for nothing to
 change: answer briefly if it's a direct question to you, otherwise ignore.
 
-**Choose the target repo — a routing judgment.** For a target-repo change,
-match the request against each entry's `description` in the `target_repos` map
-in `foreman/config.json` and pick the repo clearly responsible for the affected
-area; when no entry clearly matches, use `default_target_repo`. Choosing is
-**your** judgment — the config is a thin routing table, exactly like the Jira
-project routing in `factory-tracker-ops`. One task should normally touch **one**
-target repo; if the request genuinely spans multiple repos, flag it to the
-foreman as multiple tickets (one per repo) rather than triaging it as one.
+**Choose the target repo — a routing judgment inside the project's repos.** For
+a target-repo change, the candidate repos are the ones the ticket's **Jira
+project** owns, not every repo in the org. Ask the resolver for that list rather
+than reading `foreman/config.json` yourself:
+
+```bash
+scripts/factory-config repos --issue <task_id>
+```
+
+It prints `{project, scoped, default_repo, repos[]}` — each candidate with its
+`description` — for the project the ticket lives in (a Jira key's prefix is its
+project, so `PAY-123` yields `PAY`'s repos). Match the request against those
+descriptions and pick the repo clearly responsible for the affected area; when
+none clearly matches, use the returned `default_repo`. Choosing among the
+candidates is **your** judgment; the narrowing is not — never route a ticket to
+a repo outside its project's list (that is another team's repo), and never widen
+the list back out to every configured repo. When `scoped` is `false` the project
+declares no subset, so every target repo is legitimately a candidate. One task
+should normally touch **one** target repo; if the request genuinely spans
+multiple repos, flag it to the foreman as multiple tickets (one per repo, each
+in the owning project) rather than triaging it as one.
 
 Then judge **clarity**: do you have enough to understand the work and define
 "done"? For a **bug**, at minimum *what's wrong* and *where/how it shows up* (the
@@ -184,7 +200,10 @@ the one the foreman passed:
   Solution to be enriched after Steps 3–4.
 - **Record the chosen target repo** in the description as a
   `Target repo: <org/repo>` line (per the routing judgment in Step 2) so
-  downstream steps read it from the ticket instead of re-deciding.
+  downstream steps read it from the ticket instead of re-deciding. This line is
+  what keeps every later step (and every `scripts/factory-state` /
+  `factory-pr-meta` lookup) pointed at one repo instead of probing all of them,
+  so never leave it out.
 - **Stamp the issue's metadata** per `factory-tracker-ops`: an explicit
   **priority**, and a **categorization label** (e.g. `bug`, distinct from the
   pipeline gate label). The issue already lives in the Jira project the foreman

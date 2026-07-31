@@ -23,12 +23,14 @@ progress reporting via `factory-progress-updates`, GitHub via
 
 The task's target repo for any code research is the repo **triage chose and
 recorded on the ticket** (the `Target repo: <org/repo>` line in the enriched
-description); its settings come from that repo's entry in the `target_repos`
-map in `foreman/config.json`. If the ticket doesn't record one, pick it per
-the routing judgment in `factory-triage` (match the request against each
-entry's `description`; fall back to `default_target_repo`) and note the choice
-on the ticket. The base branch is the chosen repo's `base_branch` (from its
-`target_repos` entry).
+description); resolve its settings with
+`scripts/factory-config repo --repo <task's target repo>`. If the ticket doesn't
+record one, pick it per the routing judgment in `factory-triage` — the candidates
+are only the repos the ticket's Jira project owns
+(`scripts/factory-config repos --issue <task_id>`), matched against their
+`description` with that project's `default_repo` as the fallback — and note the
+choice on the ticket. The base branch is the chosen repo's `base_branch` from the
+same resolver call.
 
 **The approval gate is configurable.** Read `spec_approval_required` from
 `foreman/config.json` at the start of every run:
@@ -83,8 +85,9 @@ in `factory-tracker-ops`).
   ```bash
   scripts/factory-state --task-id <task_id> --repo <task's target repo>
   ```
-  (Omit `--repo` to probe all configured target repos plus `self_repo` when the
-  task's target repo isn't known yet.)
+  (When the task's target repo isn't known yet, pass `--issue <task_id>` instead
+  of `--repo` so the probe covers only that project's repos plus `self_repo`,
+  rather than every configured repo.)
   It returns `{"task_id": ..., "pr": null | {url,number,repo,state,merged,...}}`.
   If a **spec PR already exists** for this task (you opened one on a prior turn,
   or `scripts/factory-pr-meta find --task-id <task_id> --repo <task's target repo>`
@@ -251,8 +254,8 @@ Give the run a tight brief:
   alternatives worth weighing, any open questions to resolve, and a concrete,
   exhaustive list of how to validate and verify the change — for a backend or
   headless change, anchored on a regression test (per the target repo's
-  `test_guidance`) and that repo's validation gate (its `validate_command`,
-  from its `target_repos` entry) per
+  `test_guidance`) and that repo's validation gate (its `validate_command`, both
+  from `scripts/factory-config repo --repo <task's target repo>`) per
   `factory-verification` (no UI to drive, so no computer-use there); for a
   **user-facing** change, the criteria must **additionally** require exercising
   the running UI with computer use and capturing screenshot proof (per
@@ -380,8 +383,8 @@ Cover, as applicable:
 - **No collateral damage:** specific adjacent behaviors that must still work,
   and how you'll confirm (named tests, or the validation gate).
 - **Validation gate:** the target repo's validation gate (its
-  `validate_command` from its `target_repos` entry) passes (exact checks vary
-  by repo).
+  `validate_command`, from `scripts/factory-config repo`) passes (exact checks
+  vary by repo).
 - **Edge cases** relevant to the change (boundary inputs, error paths, empty/nil
   states, concurrency).
 
@@ -397,8 +400,9 @@ from code-reading is not ready to post; reproduce first. (A feature spec needs
 the ticket's requirements, not a repro.)
 
 **Commit the spec and open a draft PR (per `factory-github-ops`).** From a fresh
-clone of the task's target repo at its `base_branch` (from its `target_repos`
-entry), create a branch `factory/<short-slug>` (this same branch is reused for
+clone of the task's target repo at its `base_branch` (from
+`scripts/factory-config repo --repo <task's target repo>`), create a branch
+`factory/<short-slug>` (this same branch is reused for
 the implementation), commit the spec file from Step 4
 (`agents/specs/<ticket-key>: <very brief title>.md`) with a **descriptive
 commit message** (e.g. `spec: <short title> (<task-id>)`), and open a **draft PR**

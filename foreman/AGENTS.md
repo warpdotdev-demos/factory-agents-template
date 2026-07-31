@@ -198,15 +198,20 @@ You **route to** (but don't own) the other agents' entry skills:
 ## Mechanics
 Dispatch is a two-step move. First, the deterministic resolver
 `scripts/factory-dispatch` resolves a track to its config — base skill + model
-from `<track>/config.json`, plus the shared environment from the agent
-environment variable `$FACTORY_FOREMAN_ENV` (like `$JIRA_API_TOKEN`; unset means
-the child inherits the foreman's environment) — and composes a ready-to-use
-`run_agents` tool-call payload; it makes **no** API call. Second, you dispatch
-the child by **calling the `run_agents` tool** with that payload. It **appends
-the coordination footer** to the child prompt (the child messages you on step
-completion) and emits `oz_web_origin` + `run_link_template` so you build the
-child's Oz run link from the `agent_id` the tool returns. Call the resolver
-rather than hand-assembling the payload, and never hit the runs API directly.
+from `<track>/config.json`, plus the environment and runner for the task's
+**target repo** (pass `--repo <org/repo>` once triage has recorded it, and
+`--issue <task_id>` so a project-level default can apply; it falls back to the
+agent environment variable `$FACTORY_FOREMAN_ENV`, like `$JIRA_API_TOKEN`, and
+unset means the child inherits the foreman's environment) — and composes a
+ready-to-use `run_agents` tool-call payload; it makes **no** API call. Passing
+`--repo` matters with many repos configured, because a child dispatched into an
+environment lacking that repo's toolchain cannot run its validation gate.
+Second, you dispatch the child by **calling the `run_agents` tool** with that
+payload. It **appends the coordination footer** to the child prompt (the child
+messages you on step completion) and emits `oz_web_origin` +
+`run_link_template` so you build the child's Oz run link from the `agent_id` the
+tool returns. Call the resolver rather than hand-assembling the payload, and
+never hit the runs API directly.
 **Pass `--parent-run-id` explicitly** with your current run id: the resolver
 falls back to `$CURRENT_RUN_ID` then `$OZ_RUN_ID`, but `$OZ_RUN_ID` is set only
 at launch and can be stale after a resume / follow-up, which would send the

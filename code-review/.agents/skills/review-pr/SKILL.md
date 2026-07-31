@@ -19,8 +19,9 @@ Keep the live status comment current and status posts terse per
 `factory-progress-updates`. Use `factory-github-ops` for PR mechanics,
 `factory-verification` for the build/test toolchain, and `factory-tracker-ops`
 for posting to the task. The PR's repo is the task's target repo (the repo
-recorded on the ticket); read its `validate_command` from its entry in
-`target_repos` in `foreman/config.json`.
+recorded on the ticket); read that repo's `validate_command` with
+`scripts/factory-config repo --repo <owner/repo>` — each target repo has its own
+gate, so a gate copied from another repo proves nothing about this change.
 
 ## Step 1 — Fetch the PR and its diff
 
@@ -61,7 +62,7 @@ for whether `computer_use` applies to the target repo.
    ```bash
    gh pr checkout <pr> --repo <owner/repo>
    # Run targeted tests first for a fast inner loop
-   <the target repo's validate_command from its target_repos entry>   # fmt, lint, full test suite, build
+   <the target repo's validate_command, from scripts/factory-config repo --repo <owner/repo>>   # fmt, lint, full test suite, build
    ```
    Confirm the change **builds** and that the **tests pass** (especially any new
    regression test the change added). For **testing-exempt** changes, confirm

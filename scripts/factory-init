@@ -19,13 +19,29 @@ Two ways to supply values:
   * INTERACTIVE prompts -- run with --interactive (or with no value flags on a
     TTY) and every value is prompted for with a sensible default.
 
+Multi-project / many-repo setups: a Jira project usually owns only a SUBSET of
+the repos, so declare that mapping and routing stays scoped (a ticket in PAY
+can only reach payments repos). Three ways to express it:
+  * --project-repos KEY=org/repo1,org/repo2 (repeatable) alongside --project;
+  * --projects-json with the whole tracker.project_routing block (inline JSON
+    or @file), which also carries per-project status_map / story_points_field /
+    issue_type / spec_approval_required / environment_id overrides;
+  * the interactive prompts, which ask which repos each project owns whenever
+    more than one project or repo exists.
+At that scale the config is usually generated from an existing source of truth
+(a service catalog, CODEOWNERS, a repo manifest) -- use --projects-json plus
+--target-repos-json for that, and --merge to onboard one more project/repo into
+an already-configured factory.
+
 Jira autodiscovery (optional, on by default): when $JIRA_BASE_URL,
 $JIRA_EMAIL, and $JIRA_API_TOKEN are exported, the script calls the Jira Cloud
 REST API to
-  * list the REAL workflow status names for each routed project
+  * list the REAL workflow status names for EVERY routed project
     (GET /rest/api/3/project/<KEY>/statuses) and validate every status_map
-    value against them (warning on mismatches -- Jira status setting is
-    transition-based and silently fails later if the name is wrong), and
+    value against them (warning per project on mismatches -- Jira status
+    setting is transition-based and silently fails later if the name is wrong;
+    a project whose workflow differs wants a per-project status_map override),
+    and
   * auto-detect the story-points custom field id
     (GET /rest/api/3/field, matching "story point" in the field name).
 Discovery soft-fails: any network/auth error degrades to a stderr warning and
@@ -33,8 +49,10 @@ manual values. Pass --no-discover to skip it entirely.
 
 Safety: an existing foreman/config.json that still contains REPLACE_ME
 placeholders (pristine template state) is overwritten freely; one that was
-already customized requires --force. reviewer_overrides.json is never
-overwritten. --dry-run prints the resolved configs without writing anything.
+already customized requires --force (replace it) or --merge (add the supplied
+projects/repos, keeping every other existing value).
+reviewer_overrides.json is never overwritten. --dry-run prints the resolved
+configs without writing anything.
 
 Emits a JSON summary (written/skipped files + warnings) to stdout; fails loud
 (nonzero exit + stderr) on invalid input.
@@ -44,6 +62,7 @@ No third-party dependencies; Python 3 stdlib only.
 
 import argparse
 import base64
+import copy
 import json
 import os
 import sys
@@ -85,7 +104,24 @@ TARGET_REPO_REQUIRED_FIELDS = (
     "validate_command",
     "test_guidance",
 )
-TARGET_REPO_OPTIONAL_FIELDS = ("app_start_command", "app_url")
+TARGET_REPO_OPTIONAL_FIELDS = (
+    "app_start_command",
+    "app_url",
+    "environment_id",
+    "runner_id",
+)
+# Keys allowed on the object form of a tracker.project_routing value.
+PROJECT_REQUIRED_FIELDS = ("description",)
+PROJECT_OPTIONAL_FIELDS = (
+    "repos",
+    "default_repo",
+    "status_map",
+    "story_points_field",
+    "issue_type",
+    "spec_approval_required",
+    "environment_id",
+    "runner_id",
+)
 
 REVIEWER_OVERRIDES_SKELETON = {
     "_comment": (
@@ -206,8 +242,8 @@ def parse_pairs(raw, what):
     return result
 
 
-def load_target_repos_json(raw):
-    """Parse --target-repos-json (inline JSON or @path-to-file)."""
+def load_json_arg(raw, flag):
+    """Parse a JSON flag value (inline JSON or @path-to-file) into a dict."""
     text = raw
     if raw.startswith("@"):
         path = raw[1:]
@@ -215,14 +251,123 @@ def load_target_repos_json(raw):
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
         except OSError as e:
-            die(f"could not read --target-repos-json file {path}: {e}")
+            die(f"could not read {flag} file {path}: {e}")
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        die(f"--target-repos-json is not valid JSON: {e}")
+        die(f"{flag} is not valid JSON: {e}")
     if not isinstance(data, dict) or not data:
-        die("--target-repos-json must be a non-empty JSON object keyed by org/repo")
+        die(f"{flag} must be a non-empty JSON object")
     return data
+
+
+def load_target_repos_json(raw):
+    """Parse --target-repos-json (inline JSON or @path-to-file)."""
+    data = load_json_arg(raw, "--target-repos-json")
+    return data
+
+
+def load_projects_json(raw):
+    """Parse --projects-json (the whole tracker.project_routing block)."""
+    return load_json_arg(raw, "--projects-json")
+
+
+def parse_project_repos(raw):
+    """Parse repeatable --project-repos KEY=org/repo1,org/repo2 values."""
+    result = {}
+    for item in raw or []:
+        if "=" not in item:
+            die(f"invalid --project-repos entry {item!r}; expected "
+                "KEY=org/repo1,org/repo2")
+        key, _, value = item.partition("=")
+        key = key.strip()
+        repos = [r.strip() for r in value.split(",") if r.strip()]
+        if not key or not repos:
+            die(f"invalid --project-repos entry {item!r}; expected "
+                "KEY=org/repo1,org/repo2")
+        for repo in repos:
+            if repo not in result.setdefault(key, []):
+                result[key].append(repo)
+    return result
+
+
+def apply_project_repos(projects, project_repos):
+    """Fold the --project-repos subsets into the project entries.
+
+    A project that gains a repo subset becomes the object form; one without a
+    subset stays a plain description string, so a single-project config keeps
+    the simplest possible shape.
+    """
+    for key, repos in (project_repos or {}).items():
+        if key not in projects:
+            die(f"--project-repos names project {key!r}, which has no --project "
+                "entry")
+        entry = projects[key]
+        if isinstance(entry, str):
+            entry = {"description": entry}
+        entry["repos"] = list(repos)
+        projects[key] = entry
+    return projects
+
+
+def validate_projects(projects, target_repos, default_project, self_project):
+    """Validate project entries and every project -> repo reference."""
+    if not projects:
+        die("no Jira projects configured; pass --project or --projects-json")
+    for key, entry in projects.items():
+        if not isinstance(key, str) or not key:
+            die("project keys must be non-empty strings")
+        if isinstance(entry, str):
+            if not entry:
+                die(f"project {key!r} needs a non-empty description")
+            continue
+        if not isinstance(entry, dict):
+            die(f"project {key!r} must be a description string or a JSON object")
+        if not entry.get("description"):
+            die(f"project {key!r} is missing its `description`")
+        unknown = [
+            f for f in entry
+            if f not in PROJECT_REQUIRED_FIELDS + PROJECT_OPTIONAL_FIELDS
+        ]
+        if unknown:
+            die(f"project {key!r} has unknown field(s): " + ", ".join(unknown))
+        repos = entry.get("repos") or []
+        if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
+            die(f"project {key!r}'s `repos` must be a list of org/repo strings")
+        for repo in repos:
+            if repo not in target_repos:
+                die(f"project {key!r} lists repo {repo!r}, which is not a "
+                    "configured target repo")
+        default_repo = entry.get("default_repo")
+        if default_repo and repos and default_repo not in repos:
+            die(f"project {key!r}'s `default_repo` {default_repo!r} is not one of "
+                "its own repos")
+        status_map = entry.get("status_map")
+        if status_map is not None:
+            if not isinstance(status_map, dict) or not status_map:
+                die(f"project {key!r}'s `status_map` must be a non-empty object")
+            unknown_states = [s for s in status_map if s not in FACTORY_STATES]
+            if unknown_states:
+                die(f"project {key!r}'s `status_map` has unknown factory state(s): "
+                    + ", ".join(unknown_states))
+    if default_project not in projects:
+        die(f"default project {default_project!r} is not a configured project")
+    if self_project and self_project not in projects:
+        warn(f"self_project {self_project!r} is not a routed project; the "
+             "factory's own tickets will use the site-wide tracker defaults")
+
+    scoped = {k: e for k, e in projects.items()
+              if isinstance(e, dict) and e.get("repos")}
+    if scoped and len(scoped) == len(projects):
+        referenced = {r for e in scoped.values() for r in e["repos"]}
+        for repo in target_repos:
+            if repo not in referenced:
+                warn(f"target repo {repo!r} is not owned by any project, so no "
+                     "ticket can route to it")
+    elif len(projects) > 1 and not scoped:
+        warn(f"{len(projects)} projects are routed but none declares a repo "
+             "subset, so every ticket may route to every target repo; pass "
+             "--project-repos (or --projects-json) to scope routing")
 
 
 def validate_target_repos(target_repos):
@@ -356,6 +501,25 @@ def interactive_values(args, jira_env, warnings):
     default_target_repo = args.default_target_repo or prompt(
         "fallback target repo when routing finds no match",
         next(iter(target_repos)))
+
+    # Which repos does each project own? Routing stays scoped when a ticket can
+    # only reach its own project's repos, which matters as soon as there is
+    # more than one project or more than one repo.
+    project_repos = parse_project_repos(args.project_repos)
+    if not args.projects_json and not project_repos and (
+            len(projects) > 1 or len(target_repos) > 1):
+        print("factory-init: map each Jira project to the repos it owns "
+              "(comma-separated; empty = every target repo)", file=sys.stderr)
+        for key in projects:
+            answer = prompt(
+                f"repos owned by project {key} "
+                f"(of {', '.join(target_repos)})",
+                "", required=False)
+            repos = [r.strip() for r in answer.split(",") if r.strip()]
+            if repos:
+                project_repos[key] = repos
+    projects = apply_project_repos(projects, project_repos)
+
     spec_approval = (
         args.spec_approval_required
         if args.spec_approval_required is not None
@@ -382,18 +546,24 @@ def flag_values(args, jira_env, warnings):
     missing = []
     if not args.self_repo:
         missing.append("--self-repo")
-    if not args.project:
-        missing.append("--project")
+    if not (args.project or args.projects_json):
+        missing.append("--project or --projects-json")
     if not (args.target_repos_json or args.target_repo):
         missing.append("--target-repos-json or --target-repo")
     if missing:
         die("missing required flag(s): " + ", ".join(missing)
             + " (or run with --interactive)")
 
-    projects = parse_pairs(args.project, "--project")
+    if args.projects_json:
+        projects = load_projects_json(args.projects_json)
+        if args.project:
+            projects.update(parse_pairs(args.project, "--project"))
+    else:
+        projects = parse_pairs(args.project, "--project")
+    projects = apply_project_repos(projects, parse_project_repos(args.project_repos))
     default_project = args.default_project or next(iter(projects))
     if default_project not in projects:
-        die(f"--default-project {default_project!r} is not a --project key")
+        die(f"--default-project {default_project!r} is not a configured project")
 
     status_map = dict(DEFAULT_STATUS_MAP)
     status_map.update(parse_pairs(args.status_map, "--status-map"))
@@ -436,6 +606,10 @@ def flag_values(args, jira_env, warnings):
             entry["app_start_command"] = args.target_app_start_command
         if args.target_app_url:
             entry["app_url"] = args.target_app_url
+        if args.target_environment_id:
+            entry["environment_id"] = args.target_environment_id
+        if args.target_runner_id:
+            entry["runner_id"] = args.target_runner_id
         target_repos = {args.target_repo: entry}
 
     default_target_repo = args.default_target_repo or next(iter(target_repos))
@@ -488,6 +662,81 @@ def build_foreman_config(values):
         "self_repo": values["self_repo"],
         "self_project": values["self_project"],
     }
+
+
+def merge_foreman_config(path, values, args, warnings):
+    """Fold the supplied projects and target repos into an existing config.
+
+    This is the onboarding path for a factory that already runs: adding a Jira
+    project or a repo should not rewrite the status map, the story-points field,
+    or anybody else's routing. Only the two routing maps are merged (new keys
+    added, supplied keys replaced), plus any value the caller passed explicitly.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"could not read existing {path} to merge into: {e}")
+    if not isinstance(existing, dict):
+        die(f"{path} must be a JSON object to merge into")
+
+    merged = copy.deepcopy(existing)
+    tracker = merged.get("tracker")
+    if not isinstance(tracker, dict):
+        tracker = {}
+        merged["tracker"] = tracker
+    routing = tracker.get("project_routing")
+    if not isinstance(routing, dict):
+        routing = {}
+    routing.update(values["projects"])
+    tracker["project_routing"] = routing
+
+    target_repos = merged.get("target_repos")
+    if not isinstance(target_repos, dict):
+        target_repos = {}
+    target_repos.update(values["target_repos"])
+    merged["target_repos"] = target_repos
+
+    if existing.get("self_repo") and existing["self_repo"] != values["self_repo"]:
+        warn(f"--merge keeps the existing self_repo {existing['self_repo']!r} "
+             f"(ignoring {values['self_repo']!r})", warnings)
+
+    # Only values the caller passed explicitly override the existing config.
+    if args.default_project:
+        tracker["default_project"] = args.default_project
+    if args.issue_type:
+        tracker["issue_type"] = args.issue_type
+    if args.story_points_field is not None:
+        tracker["story_points_field"] = (
+            None if str(args.story_points_field).lower() in ("none", "null", "")
+            else args.story_points_field
+        )
+    if args.status_map:
+        status_map = tracker.get("status_map")
+        status_map = dict(status_map) if isinstance(status_map, dict) else {}
+        status_map.update(parse_pairs(args.status_map, "--status-map"))
+        tracker["status_map"] = status_map
+    if args.browse_url:
+        tracker["browse_url"] = args.browse_url.rstrip("/")
+    if args.default_target_repo:
+        merged["default_target_repo"] = args.default_target_repo
+    if args.self_project:
+        merged["self_project"] = args.self_project
+    if args.spec_approval_required is not None:
+        merged["spec_approval_required"] = args.spec_approval_required
+
+    default_target = merged.get("default_target_repo")
+    if default_target and default_target not in target_repos:
+        die(f"after the merge, default_target_repo {default_target!r} is not a "
+            "configured target repo; pass --default-target-repo")
+    default_project = tracker.get("default_project")
+    if default_project and default_project not in routing:
+        die(f"after the merge, default_project {default_project!r} is not a "
+            "routed project; pass --default-project")
+    validate_target_repos(target_repos)
+    validate_projects(routing, target_repos, default_project,
+                      merged.get("self_project"))
+    return merged
 
 
 def build_track_config(repo_root, track, self_repo):
@@ -558,6 +807,22 @@ def main(argv=None):
                         metavar="KEY=DESCRIPTION",
                         help="a routed Jira project and what it owns "
                              "(repeatable / comma-separated)")
+    parser.add_argument("--project-repos", action="append", default=[],
+                        metavar="KEY=ORG/REPO1,ORG/REPO2",
+                        help="the target repos a Jira project owns "
+                             "(repeatable, one project per flag). Scopes "
+                             "routing so a ticket in that project can only "
+                             "reach those repos; omit to leave every target "
+                             "repo a candidate")
+    parser.add_argument("--projects-json", metavar="JSON|@FILE",
+                        help="full tracker.project_routing map as inline JSON "
+                             "or @file. A value is either a description string "
+                             "or an object with description, repos, "
+                             "default_repo, and optional per-project "
+                             "status_map, story_points_field, issue_type, "
+                             "spec_approval_required, environment_id, "
+                             "runner_id. Use this to generate config for many "
+                             "projects from your own source of truth")
     parser.add_argument("--default-project",
                         help="fallback project key (default: first --project)")
     parser.add_argument("--issue-type", help="Jira issue type (default: Task)")
@@ -575,7 +840,8 @@ def main(argv=None):
                         help="full target_repos map as inline JSON or @file "
                              "(keys org/repo; fields description, base_branch, "
                              "validate_command, test_guidance, and optional "
-                             "app_start_command, app_url)")
+                             "app_start_command, app_url, environment_id, "
+                             "runner_id)")
     parser.add_argument("--target-repo",
                         help="single target org/repo (alternative to "
                              "--target-repos-json)")
@@ -591,6 +857,14 @@ def main(argv=None):
                         help="optional app-boot command for UI verification")
     parser.add_argument("--target-app-url",
                         help="optional local URL of the running app")
+    parser.add_argument("--target-environment-id",
+                        help="optional Oz cloud environment id for the single "
+                             "target repo (the environment that has its "
+                             "toolchain and clone); children working on that "
+                             "repo are dispatched into it")
+    parser.add_argument("--target-runner-id",
+                        help="optional Oz runner id for the single target repo "
+                             "(when its build needs specific compute)")
     parser.add_argument("--default-target-repo",
                         help="fallback target repo (default: first configured)")
     spec = parser.add_mutually_exclusive_group()
@@ -605,8 +879,16 @@ def main(argv=None):
                              "TTY with no value flags)")
     parser.add_argument("--no-discover", action="store_true",
                         help="skip Jira autodiscovery even when $JIRA_* is set")
-    parser.add_argument("--force", action="store_true",
-                        help="overwrite an already-customized foreman/config.json")
+    overwrite = parser.add_mutually_exclusive_group()
+    overwrite.add_argument("--force", action="store_true",
+                           help="replace an already-customized "
+                                "foreman/config.json wholesale")
+    overwrite.add_argument("--merge", action="store_true",
+                           help="merge the supplied projects and target repos "
+                                "into an already-customized "
+                                "foreman/config.json, keeping every other "
+                                "existing value (how you onboard one more "
+                                "project or repo)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the resolved configs without writing")
     parser.add_argument("--repo-root", default=DEFAULT_REPO_ROOT,
@@ -619,8 +901,8 @@ def main(argv=None):
         warn("$JIRA_BASE_URL / $JIRA_EMAIL / $JIRA_API_TOKEN not all set; "
              "skipping Jira autodiscovery (values are used as given)", warnings)
 
-    has_value_flags = bool(args.self_repo or args.project or args.target_repo
-                           or args.target_repos_json)
+    has_value_flags = bool(args.self_repo or args.project or args.projects_json
+                           or args.target_repo or args.target_repos_json)
     interactive = args.interactive or (not has_value_flags and sys.stdin.isatty())
     if interactive:
         try:
@@ -633,31 +915,51 @@ def main(argv=None):
     if "/" not in values["self_repo"]:
         die(f"self repo {values['self_repo']!r} must be org/repo")
     validate_target_repos(values["target_repos"])
+    validate_projects(values["projects"], values["target_repos"],
+                      values["default_project"], values.get("self_project"))
     missing_states = [s for s in FACTORY_STATES if not values["status_map"].get(s)]
     if missing_states:
         die("status_map is missing factory state(s): " + ", ".join(missing_states))
 
-    # Validate the status map against the real workflow when discoverable.
+    # Validate the status map against the real workflow of EVERY routed project
+    # when discoverable: multi-project sites often use different workflows, and
+    # a project whose statuses differ needs a per-project status_map override.
     if jira_env:
-        known = discover_statuses(jira_env, values["default_project"], warnings)
-        if known:
+        for project in values["projects"]:
+            known = discover_statuses(jira_env, project, warnings)
+            if not known:
+                continue
             lowered = {k.lower() for k in known}
-            for state, status in values["status_map"].items():
-                if status.lower() not in lowered:
-                    warn(
-                        f"status_map[{state!r}] = {status!r} is not a status in "
-                        f"project {values['default_project']} (statuses: "
-                        + ", ".join(sorted(known)) + ")",
-                        warnings,
-                    )
+            effective = dict(values["status_map"])
+            entry = values["projects"][project]
+            if isinstance(entry, dict) and isinstance(entry.get("status_map"), dict):
+                effective.update(entry["status_map"])
+            mismatched = [
+                f"{state} -> {status}" for state, status in effective.items()
+                if status.lower() not in lowered
+            ]
+            if mismatched:
+                warn(
+                    f"project {project}: " + "; ".join(mismatched)
+                    + " is not a status in that project (statuses: "
+                    + ", ".join(sorted(known))
+                    + "); add a per-project `status_map` override for it",
+                    warnings,
+                )
 
     foreman_path = os.path.join(args.repo_root, "foreman", "config.json")
-    if not is_pristine(foreman_path) and not args.force and not args.dry_run:
+    customized = not is_pristine(foreman_path)
+    if customized and not (args.force or args.merge) and not args.dry_run:
         die(f"{foreman_path} is already customized (no {PLACEHOLDER} "
-            "placeholders); pass --force to overwrite it")
+            "placeholders); pass --merge to add the supplied projects/repos, or "
+            "--force to replace it")
+
+    foreman_config = build_foreman_config(values)
+    if args.merge and customized:
+        foreman_config = merge_foreman_config(foreman_path, values, args, warnings)
 
     written, skipped = [], []
-    write_json(foreman_path, build_foreman_config(values), args.dry_run, written)
+    write_json(foreman_path, foreman_config, args.dry_run, written)
     for track in TRACKS:
         path = os.path.join(args.repo_root, track, "config.json")
         write_json(path, build_track_config(args.repo_root, track,

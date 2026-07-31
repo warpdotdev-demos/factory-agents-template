@@ -194,6 +194,49 @@ In `foreman/config.json`:
 - `tracker.issue_type` — the issue type for factory-created tickets (e.g.
   `Task`). It must exist in every routed project.
 
+**With more than one project, use the object form and declare the repos each
+project owns** (see step 6 for the repos themselves). This is the single most
+important setting for a multi-team factory, because it scopes repo routing to
+the owning team and keeps the routing judgment over a handful of candidates:
+
+```json
+"project_routing": {
+  "PAY": {
+    "description": "payments and billing — checkout, subscriptions, invoicing",
+    "repos": ["acme/payments-api", "acme/billing-worker", "acme/webapp"],
+    "default_repo": "acme/payments-api"
+  },
+  "SEARCH": {
+    "description": "search and discovery — query service, indexing, ranking",
+    "repos": ["acme/search-service", "acme/webapp"],
+    "default_repo": "acme/search-service",
+    "status_map": { "In Review": "Code Review" },
+    "story_points_field": "customfield_10032",
+    "issue_type": "Bug"
+  }
+}
+```
+
+Notes for multi-project sites:
+
+- A repo may be owned by several projects (a shared web app is the common
+  case) — list it under each.
+- A project with **no** `repos` list leaves every target repo a candidate; that
+  is the single-project shape, and it is what a bare description string means.
+- Projects rarely share one workflow. When a project's statuses, story-points
+  field, or issue type differ, override them **in that project's entry** rather
+  than bending the site-wide values; `scripts/tracker` resolves the right ones
+  per issue. Team-managed (next-gen) projects in particular each get their own
+  story-points custom field id — re-run the step-4 lookup per project.
+- Check the result with `scripts/factory-config projects` (every project with
+  its repos and effective settings) and
+  `scripts/factory-config repos --key <PROJECT-KEY>` (what a ticket there can
+  route to). `scripts/factory-validate-config` fails on a project that
+  references an unknown repo and warns about a repo no project can reach.
+- Deduplication searches every routed project by default, so the service
+  account needs read access in all of them (step 2).
+- `foreman/config.multi-project.example.json` is a full worked example.
+
 ## 6. Point the factory at your target repos
 
 Still in `foreman/config.json`:
@@ -217,8 +260,14 @@ Still in `foreman/config.json`:
     runserver 8000`); omit for headless repos.
   - `app_url` (optional) — the local URL the app serves once started (e.g.
     `http://localhost:8000`).
+  - `environment_id` (optional) — the Oz cloud environment that clones this repo
+    and has its toolchain (see step 8). Set this per repo once you have more
+    than a couple of repos, so each child step runs where that repo's
+    `validate_command` actually works.
+  - `runner_id` (optional) — the Oz runner for this repo, when its build needs
+    specific compute.
 - `default_target_repo` — the `org/repo` to fall back to when no entry clearly
-  matches a request.
+  matches a request and the ticket's project declares no `default_repo`.
 - `spec_approval_required` — keep `true` to pause for a human spec approval
   before implementation; set `false` to let approved-by-default specs
   auto-advance. Start with `true` until you trust the loop.
@@ -243,7 +292,35 @@ gate; its `target_repos` block:
 ```
 
 A multi-repo setup adds one entry per repo, each with its own stack-specific
-gate; triage routes each request to the entry whose description matches.
+gate; triage routes each request to the candidate repo whose description
+matches — the candidates being the repos the ticket's Jira project owns (step
+5).
+
+At fleet scale, do not hand-write this map. Generate it from whatever already
+knows ownership (a service catalog, `CODEOWNERS`, a repo manifest) and feed it
+in, then onboard later additions with `--merge`:
+
+```bash
+scripts/factory-init --projects-json @projects.json \
+  --target-repos-json @repos.json \
+  --self-repo <YOUR-ORG>/factory-agents --self-project <PLATFORM-KEY>
+
+scripts/factory-init --merge --self-repo <YOUR-ORG>/factory-agents \
+  --project "OPS=infrastructure and deploys" \
+  --project-repos "OPS=acme/terraform" \
+  --target-repo acme/terraform --target-description "infra as code" \
+  --target-base-branch main --target-validate-command "terraform validate" \
+  --target-test-guidance "terraform test under tests/"
+```
+
+Sanity-check the routing before the dry run:
+
+```bash
+scripts/factory-config projects                       # every project + its repos
+scripts/factory-config repos --key <PROJECT-KEY>      # a ticket's candidates
+scripts/factory-config repo --repo <org/repo>         # gate, branch, environment
+scripts/factory-validate-config                       # references + placeholders
+```
 
 Commit the config changes to your copy of the repo.
 
@@ -285,9 +362,10 @@ Then add one entry per teammate to both maps:
 Slack `<@USERID>` tokens into real Jira mentions (`[~accountid:...]`) so the
 person is actually tagged and notified on the ticket.
 
-## 8. Create the Oz cloud environment
+## 8. Create the Oz cloud environment(s)
 
-Create a cloud environment for factory runs (Oz → Environments) that:
+For a **small setup (one or a few repos)**, one environment is enough. Create a
+cloud environment for factory runs (Oz → Environments) that:
 
 - clones **all** the repos: every repo in `target_repos` (each on its
   `base_branch`) and your copy of this template (on `main`);
@@ -301,6 +379,29 @@ Create a cloud environment for factory runs (Oz → Environments) that:
   steps are always dispatched into it explicitly rather than inheriting the
   foreman's environment.
 
+**With many repos, split it up.** One image carrying every stack becomes slow to
+build, expensive to boot, and prone to toolchain conflicts. Instead:
+
+- create **one environment per repo (or per repo family that shares a
+  toolchain)**, each cloning just those repos plus your template copy, with only
+  that stack's tooling and the same Jira secrets and `gh` auth;
+- record each one as `environment_id` on the matching `target_repos` entry (step
+  6), or as a per-project `environment_id` when a whole project shares one;
+- keep a lightweight **shared** environment as `FACTORY_FOREMAN_ENV` for the
+  foreman and for any step dispatched before a repo is chosen (the first triage
+  dispatch);
+- add `runner_id` where a repo's build needs more memory or a different OS.
+
+The foreman passes `--repo` / `--issue` to `scripts/factory-dispatch`, which
+resolves the repo's environment first, then the project's, then
+`$FACTORY_FOREMAN_ENV`. Verify a repo resolves the way you expect:
+
+```bash
+scripts/factory-dispatch --track implementation --prompt probe \
+  --parent-run-id probe --repo <org/repo> \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['environment_id'], d['environment_source'])"
+```
+
 ## 9. Connect the Slack door
 
 Connect the Slack integration in your Oz workspace settings and create the
@@ -311,9 +412,10 @@ base prompt**, referencing it repo-qualified:
 <YOUR-ORG>/factory-agents-template:foreman/.agents/skills/factory-foreman/SKILL.md
 ```
 
-Point the integration at the environment from step 8. Requests that arrive
-via Slack converse in the Slack thread; the Jira ticket stays record-only
-(see "The record vs. the conversation" in `README.md`).
+Point the integration at the **shared** environment from step 8 (the foreman's
+own environment; child steps move themselves into each repo's environment).
+Requests that arrive via Slack converse in the Slack thread; the Jira ticket
+stays record-only (see "The record vs. the conversation" in `README.md`).
 
 ## 10. Connect the Jira door
 
@@ -349,13 +451,18 @@ variables in the run environment (e.g. the eval environment's variables).
 
 Finally, run one low-stakes request end to end against real providers:
 
-1. Pick (or file) a small, well-understood ticket in a routed Jira project.
+1. Pick (or file) a small, well-understood ticket in a routed Jira project. With
+   several projects configured, do this once per project — each one exercises
+   its own status map, story-points field, and repo subset.
 2. Trigger the factory through one door — mention it in Slack with the ticket
    key, or comment on the Jira ticket.
 3. Watch the loop: triage → (spec) → implementation → review. Confirm the
    ticket's gate labels, status transitions, story-point estimate, recorded
    target repo (the `Target repo: <org/repo>` line), and PR remote link all
    appear in Jira, and that the PR opens in the recorded target repo against
-   that repo's `base_branch`.
+   that repo's `base_branch`. On a multi-project setup, also confirm the
+   recorded target repo is one that ticket's project **owns** (compare against
+   `scripts/factory-config repos --issue <TICKET-KEY>`) — a repo from another
+   project's list means the project descriptions overlap and need sharpening.
 4. Approve the spec if asked, and merge the PR yourself — the factory never
    merges. On merge, the ticket should move to Done with a closing comment.
