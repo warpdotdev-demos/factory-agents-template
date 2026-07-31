@@ -13,7 +13,14 @@ Any factory skill that ships or reviews a change defers here for the mechanics �
 and for the rule that this step is **not optional**.
 
 The two knobs come from the task's target repo's entry in `target_repos` in
-`foreman/config.json`:
+`foreman/config.json`. Read them for the repo recorded on the ticket — never
+assume another repo's gate, which at many repos is how a change gets "validated"
+by the wrong toolchain:
+
+```bash
+scripts/factory-config repo --repo <task's target repo>
+```
+
 - `validate_command` — that repo's full validation gate (formatting,
   linting, tests, build — exact tools vary by repo). Run it from the target repo
   root; it must pass before any PR is opened or marked ready.
@@ -88,9 +95,9 @@ opening (or marking ready) the PR.
    (Skip this step for testing-exempt changes — proceed directly to the
    validation gate.)
 2. **Add a regression test that fails before the fix and passes after** — unless the change is testing-exempt (see *This verification is MANDATORY* above). Write it per the target repo's `test_guidance` (from its `target_repos` entry). This is the contract that proves the defect is gone and stays gone. Put it next to the code it covers, following the repo's existing test conventions. Name it so the failure clearly maps to the bug. If skipping, name the testing-exempt category and state the rationale in the task update and PR body.
-3. **Run the full gate unconditionally** — every change, testing-exempt ones included. From the target repo root, run that repo's validation gate:
+3. **Run the full gate unconditionally** — every change, testing-exempt ones included. From the target repo root, run that repo's validation gate (the `validate_command` returned by `scripts/factory-config repo --repo <task's target repo>`):
    ```bash
-   <the target repo's validate_command from its target_repos entry in foreman/config.json>
+   <the target repo's validate_command>
    ```
    It runs formatting, linting, the test suite, and the build (exact tools vary
    by repo — consult the command's script or the repo's README). For a faster

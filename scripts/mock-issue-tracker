@@ -516,7 +516,17 @@ def build_parser():
 
     p_search = sub.add_parser("search-issues", help="Keyword-search open issues for deduplication.")
     p_search.add_argument("query_text", help="Key terms to search for (e.g. 'login endpoint 500').")
-    p_search.add_argument("--team", default=DEFAULT_TEAM, help=f"Team name or key (default: {DEFAULT_TEAM}).")
+    p_search.add_argument(
+        "--team",
+        action="append",
+        default=None,
+        metavar="PROJECTKEY",
+        help=(
+            "Project key(s) to scope the search (repeatable; recorded only, the "
+            "mock searches its whole store). Mirrors the real provider, whose "
+            "default is every routed project."
+        ),
+    )
     p_search.set_defaults(func=cmd_search_issues)
 
     p_projects = sub.add_parser(

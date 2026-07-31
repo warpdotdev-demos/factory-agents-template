@@ -1,4 +1,5 @@
 {
+  "_comment": "Single-project starter shape. With several Jira projects, replace a project_routing value with an object that also declares the repos that project owns, e.g. \"PAY\": {\"description\": \"payments and billing\", \"repos\": [\"acme/payments-api\"], \"default_repo\": \"acme/payments-api\"} - see the Configuration reference in README.md and foreman/config.example.json.",
   "tracker": {
     "provider": "jira",
     "project_routing": {

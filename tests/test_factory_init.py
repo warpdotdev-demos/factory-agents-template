@@ -151,6 +151,204 @@ class WritesConfigsTest(unittest.TestCase):
             self.assertTrue(all(w["dry_run"] for w in summary["written"]))
 
 
+class MultiProjectTest(unittest.TestCase):
+    """A Jira project owns a subset of the repos; init records that mapping."""
+
+    REPOS = {
+        "acme/payments-api": {
+            "description": "payments API",
+            "base_branch": "main",
+            "validate_command": "make check",
+            "test_guidance": "pytest under tests/",
+            "environment_id": "env-payments",
+        },
+        "acme/search-service": {
+            "description": "search service",
+            "base_branch": "main",
+            "validate_command": "cargo test",
+            "test_guidance": "cargo test",
+        },
+    }
+
+    def _flags(self, extra=None):
+        return [
+            "--no-discover",
+            "--self-repo", "acme/factory-agents",
+            "--story-points-field", "customfield_10016",
+            "--target-repos-json", json.dumps(self.REPOS),
+            "--default-target-repo", "acme/payments-api",
+        ] + (extra or [])
+
+    def test_project_repos_scopes_each_project(self):
+        flags = self._flags([
+            "--project", "PAY=payments and billing",
+            "--project", "SEARCH=search and discovery",
+            "--default-project", "PAY",
+            "--self-project", "PAY",
+            "--project-repos", "PAY=acme/payments-api",
+            "--project-repos", "SEARCH=acme/search-service",
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            code, _ = run_init(root, flags=flags)
+            self.assertEqual(code, 0)
+            routing = read_json(root, "foreman", "config.json")["tracker"][
+                "project_routing"]
+            self.assertEqual(routing["PAY"]["repos"], ["acme/payments-api"])
+            self.assertEqual(routing["PAY"]["description"],
+                             "payments and billing")
+            self.assertEqual(routing["SEARCH"]["repos"], ["acme/search-service"])
+
+    def test_single_project_stays_a_plain_description_string(self):
+        with tempfile.TemporaryDirectory() as root:
+            code, _ = run_init(root)
+            self.assertEqual(code, 0)
+            routing = read_json(root, "foreman", "config.json")["tracker"][
+                "project_routing"]
+            self.assertEqual(routing["ENG"], "backend services and APIs")
+
+    def test_projects_json_carries_per_project_overrides(self):
+        projects = {
+            "PAY": {
+                "description": "payments",
+                "repos": ["acme/payments-api"],
+                "default_repo": "acme/payments-api",
+            },
+            "SEARCH": {
+                "description": "search",
+                "repos": ["acme/search-service"],
+                "status_map": {"In Review": "Code Review"},
+                "story_points_field": "customfield_10032",
+                "issue_type": "Bug",
+                "spec_approval_required": False,
+            },
+        }
+        flags = self._flags([
+            "--projects-json", json.dumps(projects),
+            "--default-project", "PAY",
+            "--self-project", "PAY",
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            code, _ = run_init(root, flags=flags)
+            self.assertEqual(code, 0)
+            routing = read_json(root, "foreman", "config.json")["tracker"][
+                "project_routing"]
+            self.assertEqual(routing["SEARCH"]["story_points_field"],
+                             "customfield_10032")
+            self.assertFalse(routing["SEARCH"]["spec_approval_required"])
+
+    def test_project_repos_referencing_unknown_repo_fails(self):
+        flags = self._flags([
+            "--project", "PAY=payments",
+            "--project-repos", "PAY=acme/ghost",
+            "--self-project", "PAY",
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as ctx:
+                    run_init(root, flags=flags)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("acme/ghost", stderr.getvalue())
+
+    def test_project_repos_for_unknown_project_fails(self):
+        flags = self._flags([
+            "--project", "PAY=payments",
+            "--project-repos", "NOPE=acme/payments-api",
+            "--self-project", "PAY",
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    run_init(root, flags=flags)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_project_default_repo_outside_its_subset_fails(self):
+        projects = {
+            "PAY": {
+                "description": "payments",
+                "repos": ["acme/payments-api"],
+                "default_repo": "acme/search-service",
+            }
+        }
+        flags = self._flags([
+            "--projects-json", json.dumps(projects),
+            "--self-project", "PAY",
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    run_init(root, flags=flags)
+            self.assertEqual(ctx.exception.code, 1)
+
+
+class MergeTest(unittest.TestCase):
+    """--merge onboards one more project/repo without rewriting the rest."""
+
+    def _configure(self, root):
+        code, _ = run_init(root, extra=["--status-map", "Done=Shipped"])
+        self.assertEqual(code, 0)
+
+    def test_merge_adds_project_and_repo_and_keeps_the_rest(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._configure(root)
+            code, _ = run_init(root, flags=[
+                "--no-discover", "--merge",
+                "--self-repo", "acme/factory-agents",
+                "--project", "OPS=infrastructure and deploys",
+                "--project-repos", "OPS=acme/terraform",
+                "--target-repo", "acme/terraform",
+                "--target-description", "infra as code",
+                "--target-base-branch", "main",
+                "--target-validate-command", "terraform validate",
+                "--target-test-guidance", "terraform test under tests/",
+                "--target-environment-id", "env-ops",
+            ])
+            self.assertEqual(code, 0)
+            foreman = read_json(root, "foreman", "config.json")
+            routing = foreman["tracker"]["project_routing"]
+            self.assertEqual(sorted(routing), ["ENG", "OPS"])
+            self.assertEqual(routing["OPS"]["repos"], ["acme/terraform"])
+            self.assertEqual(sorted(foreman["target_repos"]),
+                             ["acme/terraform", "acme/webapp"])
+            self.assertEqual(
+                foreman["target_repos"]["acme/terraform"]["environment_id"],
+                "env-ops")
+            # Untouched values survive the merge.
+            self.assertEqual(foreman["tracker"]["status_map"]["Done"], "Shipped")
+            self.assertEqual(foreman["tracker"]["default_project"], "ENG")
+            self.assertEqual(foreman["default_target_repo"], "acme/webapp")
+
+    def test_merge_can_repoint_defaults_when_asked(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._configure(root)
+            code, _ = run_init(root, flags=[
+                "--no-discover", "--merge",
+                "--self-repo", "acme/factory-agents",
+                "--project", "OPS=infrastructure",
+                "--default-project", "OPS",
+                "--target-repo", "acme/terraform",
+                "--target-description", "infra as code",
+                "--target-base-branch", "main",
+                "--target-validate-command", "terraform validate",
+                "--target-test-guidance", "terraform test",
+                "--default-target-repo", "acme/terraform",
+            ])
+            self.assertEqual(code, 0)
+            foreman = read_json(root, "foreman", "config.json")
+            self.assertEqual(foreman["tracker"]["default_project"], "OPS")
+            self.assertEqual(foreman["default_target_repo"], "acme/terraform")
+
+    def test_refusal_points_at_merge_and_force(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._configure(root)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    run_init(root, extra=["--self-project", "OTHER"])
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("--merge", stderr.getvalue())
+            self.assertIn("--force", stderr.getvalue())
+
+
 class PreservationAndSafetyTest(unittest.TestCase):
     def test_preserves_existing_track_skill_and_model(self):
         with tempfile.TemporaryDirectory() as root:

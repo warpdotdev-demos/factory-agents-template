@@ -29,7 +29,15 @@ Tracks: `triage`, `spec`, `implementation`, `code-review`. Each track's task
 list is authored to that track's entry gate:
 
 - **triage** — a raw bug/feature request. Expected artifact: a **tracker
-  issue** (no PR).
+  issue** (no PR). With several Jira projects and many repos configured,
+  **routing accuracy is the main quality risk**, so include tasks that should
+  land in a specific `(project, repo)` pair — especially near-miss wording that
+  could plausibly match a neighbouring team's repo description — and grade the
+  run on the ticket's project and its recorded `Target repo` line. Compare a
+  task's expected repo against
+  `scripts/factory-config repos --key <PROJECT-KEY>`; a routing miss usually
+  means two `description` fields overlap and need sharpening, not that the agent
+  misbehaved.
 - **spec** — a change that needs a written spec.
 - **implementation** — an obvious fix or an approved spec. Expected artifact:
   a **PR** (with a metadata-linked tracker issue).

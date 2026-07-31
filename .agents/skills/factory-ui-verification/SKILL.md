@@ -59,13 +59,15 @@ Follow these four steps.
 
 **Step 1 — Start the application server before the session.**
 Before opening a `computer_use` session, start the app server so it is
-reachable at a local URL. The task's target repo entry in config `target_repos`
-(in `foreman/config.json`) declares how — its optional `app_start_command` is
-the command that boots the app for UI verification, and its optional `app_url`
-is the local URL the running app serves. Run the start command **in the
-background** from the repo root.
+reachable at a local URL. Resolve how from the task's target repo, which
+declares its own optional `app_start_command` (the command that boots the app
+for UI verification) and `app_url` (the local URL it serves) — different repos
+boot differently, so read the one you are working in.
 ```bash
-# The target repo's app_start_command from its target_repos entry:
+scripts/factory-config repo --repo <task's target repo>
+```
+Run that repo's start command **in the background** from the repo root.
+```bash
 <app_start_command> &
 ```
 Wait a few seconds for the server to become ready at the repo's `app_url`.

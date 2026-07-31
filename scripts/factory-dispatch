@@ -23,9 +23,13 @@ execution principal ("agents cannot specify a different execution principal").
 Reconstructing the config inline keeps execution principal = foreman while still
 giving the child the right skills/model.
 
-skill + model are per-track (from <track>/config.json);
-environment_id is shared and comes from the agent's environment
-(FACTORY_FOREMAN_ENV), like the Jira API token comes from $JIRA_API_TOKEN.
+skill + model are per-track (from <track>/config.json); environment_id and
+runner_id are per TARGET REPO (or per Jira project) with the agent's
+environment (FACTORY_FOREMAN_ENV / FACTORY_FOREMAN_RUNNER) as the shared
+fallback, like the Jira API token comes from $JIRA_API_TOKEN. At many repos a
+single environment cloning every repo with every toolchain stops being
+practical, so pass --repo (the task's target repo) and the child lands in that
+repo's environment.
 
 Resolution order for skill (per track), first wins:
   1. explicit flag (--skill)
@@ -50,12 +54,20 @@ the minute) unless an explicit --name is passed, which wins (see
 _build_run_name). The name is emitted as the child's `run_agents`
 agent_run_configs[].name.
 
-Resolution order for environment_id (shared), first wins:
+Resolution order for environment_id, first wins:
   1. explicit flag (--environment)
-  2. agent environment variable (FACTORY_FOREMAN_ENV)
+  2. the target repo's `environment_id` in foreman config `target_repos`
+     (when --repo is passed)
+  3. the Jira project's `environment_id` in foreman config
+     `tracker.project_routing` (when --project / --issue is passed, or the repo
+     is owned by exactly one project)
+  4. agent environment variable (FACTORY_FOREMAN_ENV)
 If unresolved, the `run_agents` tool's own default environment applies (the child
-inherits the foreman's environment); it is never hardcoded in config. When
-resolved, it is emitted as `run_agents` remote.environment_id.
+inherits the foreman's environment). When resolved, it is emitted as
+`run_agents` remote.environment_id, and `environment_source` records which rule
+won. runner_id resolves the same way (--runner -> repo -> project ->
+FACTORY_FOREMAN_RUNNER) and is emitted as `run_agents` remote.runner_id only
+when resolved.
 
 Resolution order for parent run id (names the foreman run the child reports step
   completion to; embedded in the coordination footer of the child brief), first
@@ -340,21 +352,116 @@ def _build_run_name(explicit_name, track):
     return f"{RUN_NAME_PREFIX}_{track}_{timestamp}"
 
 
-def _resolve_environment(flag):
-    """Resolve the shared environment id (applies to every track).
+FOREMAN_CONFIG_PATH = os.path.join(REPO_ROOT, "foreman", "config.json")
 
-    Order: --environment flag -> FACTORY_FOREMAN_ENV (the agent environment
-    variable, like $JIRA_API_TOKEN). PLACEHOLDER is treated as unset; returns
-    None when unresolved, in which case the run_agents tool's default
-    environment applies (the child inherits the foreman's environment). The
-    environment id is never hardcoded in config.
-    """
-    if flag and flag != PLACEHOLDER:
-        return flag
-    env_val = os.environ.get("FACTORY_FOREMAN_ENV")
-    if env_val and env_val != PLACEHOLDER:
-        return env_val
+
+def _clean(value):
+    """A usable config string, or None (empty / non-string / PLACEHOLDER)."""
+    if isinstance(value, str) and value and PLACEHOLDER not in value:
+        return value
     return None
+
+
+def _foreman_config():
+    """Best-effort read of foreman/config.json; {} when absent or unreadable."""
+    data = _load_json(FOREMAN_CONFIG_PATH, "foreman config")
+    return data or {}
+
+
+def _project_key_from_issue(issue_key):
+    """The Jira project key an issue key belongs to (PAY-123 -> PAY)."""
+    text = (issue_key or "").strip()
+    if not text:
+        return None
+    if "-" in text:
+        text = text.rsplit("-", 1)[0]
+    return text.strip().upper() or None
+
+
+def _project_entry(config, project):
+    """The object form of a `tracker.project_routing` entry, else {}."""
+    if not project:
+        return {}
+    tracker = config.get("tracker")
+    routing = tracker.get("project_routing") if isinstance(tracker, dict) else None
+    entry = routing.get(project) if isinstance(routing, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _repo_entry(config, repo):
+    """The `target_repos` entry for a repo, else {}."""
+    if not repo:
+        return {}
+    target_repos = config.get("target_repos")
+    entry = target_repos.get(repo) if isinstance(target_repos, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _owning_project(config, repo):
+    """The single project that owns a repo, or None when it is ambiguous.
+
+    Only projects that declare a `repos` subset are considered; when exactly one
+    of them lists this repo, its per-project settings apply.
+    """
+    tracker = config.get("tracker")
+    routing = tracker.get("project_routing") if isinstance(tracker, dict) else None
+    if not isinstance(routing, dict) or not repo:
+        return None
+    owners = [
+        key for key, entry in routing.items()
+        if isinstance(entry, dict) and repo in (entry.get("repos") or [])
+    ]
+    return owners[0] if len(owners) == 1 else None
+
+
+def _resolve_execution_setting(field, flag, env_var, repo, project):
+    """Resolve environment_id / runner_id for a dispatch, with its source.
+
+    Order (first wins): explicit flag -> the target repo's `target_repos` entry
+    -> the Jira project's `project_routing` entry -> the agent environment
+    variable. Returns (value, source); (None, None) when unresolved, in which
+    case the run_agents tool's own default applies.
+    """
+    flag_val = _clean(flag)
+    if flag_val:
+        return flag_val, "flag"
+
+    config = _foreman_config()
+    if repo:
+        known = config.get("target_repos")
+        if isinstance(known, dict) and repo not in known:
+            _warn(
+                f"--repo {repo!r} is not a `target_repos` key in "
+                f"{FOREMAN_CONFIG_PATH}; falling back to the shared environment"
+            )
+        repo_val = _clean(_repo_entry(config, repo).get(field))
+        if repo_val:
+            return repo_val, f"target_repos[{repo}].{field}"
+
+    project = project or _owning_project(config, repo)
+    if project:
+        project_val = _clean(_project_entry(config, project).get(field))
+        if project_val:
+            return project_val, f"project_routing[{project}].{field}"
+
+    env_val = _clean(os.environ.get(env_var))
+    if env_val:
+        return env_val, f"${env_var}"
+    return None, None
+
+
+def _resolve_environment(flag, repo=None, project=None):
+    """Resolve the child's environment id (see _resolve_execution_setting)."""
+    return _resolve_execution_setting(
+        "environment_id", flag, "FACTORY_FOREMAN_ENV", repo, project
+    )
+
+
+def _resolve_runner(flag, repo=None, project=None):
+    """Resolve the child's runner id (see _resolve_execution_setting)."""
+    return _resolve_execution_setting(
+        "runner_id", flag, "FACTORY_FOREMAN_RUNNER", repo, project
+    )
 
 
 def _clean_run_id(value):
@@ -462,6 +569,7 @@ def _build_run_agents_payload(
     name,
     track,
     computer_use_enabled,
+    runner_id=None,
 ):
     """Compose the run_agents tool-call arguments for one factory child step.
 
@@ -473,6 +581,8 @@ def _build_run_agents_payload(
     remote = {"computer_use_enabled": computer_use_enabled}
     if environment_id:
         remote["environment_id"] = environment_id
+    if runner_id:
+        remote["runner_id"] = runner_id
     agent_run_config = {
         "name": name or f"factory-{track}",
         "title": f"factory {track}",
@@ -523,10 +633,12 @@ def main():
             "Resolve the run_agents tool-call parameters for one factory child "
             "step, applying the track's config (skill + model). "
             "Resolves config per track from <track>/config.json + the "
-            "shared environment from the agent environment variable "
-            "$FACTORY_FOREMAN_ENV (flag -> env var), names the run "
+            "environment/runner for the task's target repo (--repo / --project "
+            "-> foreman/config.json -> $FACTORY_FOREMAN_ENV / "
+            "$FACTORY_FOREMAN_RUNNER), names the run "
             "FA_<track>_<UTC timestamp>, and emits "
-            "{track,skill,model,name,environment_id,"
+            "{track,skill,model,name,target_repo,project,environment_id,"
+            "environment_source,runner_id,runner_source,"
             "computer_use_enabled,parent_run_id,"
             "oz_web_origin,run_link_template,run_agents} as JSON. The foreman "
             "then CALLS the run_agents tool with the emitted `run_agents` "
@@ -575,8 +687,42 @@ def main():
         help="Override the resolved base model for this track.",
     )
     parser.add_argument(
+        "--repo",
+        metavar="ORG/REPO",
+        help=(
+            "The task's target repo (a `target_repos` key in "
+            "foreman/config.json). Its `environment_id` / `runner_id` are used "
+            "for this child, so a many-repo factory dispatches each step into "
+            "the environment that has that repo's toolchain."
+        ),
+    )
+    parser.add_argument(
+        "--project",
+        metavar="PROJECTKEY",
+        help=(
+            "The task's Jira project key (or pass --issue and it is derived). "
+            "Used for the per-project environment/runner fallback when the repo "
+            "declares none."
+        ),
+    )
+    parser.add_argument(
+        "--issue",
+        metavar="ISSUEKEY",
+        help="The task's issue key (e.g. PAY-123); the project is its prefix.",
+    )
+    parser.add_argument(
         "--environment",
-        help="Override the resolved (shared) environment id for this run.",
+        help=(
+            "Override the resolved environment id for this run (wins over the "
+            "repo's and project's configured environment)."
+        ),
+    )
+    parser.add_argument(
+        "--runner",
+        help=(
+            "Override the resolved runner id for this run (wins over the repo's "
+            "and project's configured runner)."
+        ),
     )
     parser.add_argument(
         "--parent-run-id",
@@ -622,7 +768,12 @@ def main():
         )
     model = _resolve_model(args.track, args.model, config)
     run_name = _build_run_name(args.name, args.track)
-    environment_id = _resolve_environment(args.environment)
+    target_repo = (args.repo or "").strip() or None
+    project = (args.project or "").strip().upper() or _project_key_from_issue(args.issue)
+    environment_id, environment_source = _resolve_environment(
+        args.environment, target_repo, project
+    )
+    runner_id, runner_source = _resolve_runner(args.runner, target_repo, project)
     parent_run_id = _resolve_parent_run_id(args.parent_run_id)
     if not parent_run_id:
         _die(
@@ -643,6 +794,7 @@ def main():
         run_name,
         args.track,
         args.computer_use,
+        runner_id,
     )
 
     result = {
@@ -650,7 +802,12 @@ def main():
         "skill": skill,
         "model": model,
         "name": run_name,
+        "target_repo": target_repo,
+        "project": project,
         "environment_id": environment_id,
+        "environment_source": environment_source,
+        "runner_id": runner_id,
+        "runner_source": runner_source,
         "computer_use_enabled": args.computer_use,
         "parent_run_id": parent_run_id,
         "oz_web_origin": oz_web_origin,

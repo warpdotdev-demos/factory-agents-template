@@ -66,9 +66,14 @@ Per agent:
   type) plus the multi-repo target settings every step reads (`target_repos` —
   a map of `org/repo` → per-repo `description`, `base_branch`,
   `validate_command`, `test_guidance` — and `default_target_repo`), along with
-  `spec_approval_required`, `self_repo`, and `self_project`. See
-  "Configuration reference" below. The shared cloud environment id is **not**
-  stored here — it comes from the agent environment variable
+  `spec_approval_required`, `self_repo`, and `self_project`. A
+  **multi-project, many-repo** team maps each Jira project to the **subset of
+  repos it owns** (and, where workflows differ, overrides the status map /
+  story-points field / issue type per project) in the same file — see
+  "Many Jira projects, many repos" and "Configuration reference" below.
+  Agents read all of it through `scripts/factory-config` rather than parsing
+  the JSON. A cloud environment id can be set **per repo** (or per project);
+  otherwise it comes from the agent environment variable
   `$FACTORY_FOREMAN_ENV` (like the Jira credentials), so a dispatched child
   inherits the foreman's environment by default.
 - Skills resolve by name, so each agent sees its own `.agents/skills/` + the
@@ -92,9 +97,10 @@ Per agent:
   pauses (a clarifying question or an exhausted rework budget). It never does
   the downstream work itself. Skill: `factory-foreman`.
 - **triage** — owns triage only. Reads the task + PR state, classifies the
-  report, **chooses the target repo** (matching the request against the
-  `target_repos` descriptions, falling back to `default_target_repo`, and
-  recording the choice on the ticket), files/enriches the Jira ticket,
+  report, **chooses the target repo** (from the repos the ticket's Jira project
+  owns — `scripts/factory-config repos --issue <key>` — matching the request
+  against those descriptions, falling back to that project's `default_repo`,
+  and recording the choice on the ticket), files/enriches the Jira ticket,
   reproduces **non-trivial** bugs,
   evaluates complexity, then applies triage's completion label (`spec-done` or
   `triage-done`), sets status **Todo**, records the story-point estimate,
@@ -188,6 +194,83 @@ human. Each step records its artifacts on the ticket and messages the foreman
 on completion; the gate label plus companion status/artifact/estimate signals
 are the durable source of truth.
 
+## Many Jira projects, many repos
+
+A team with several Jira projects and a fleet of repos is the normal case, and
+the two routing tables in `foreman/config.json` are related rather than
+independent — **a Jira project owns a subset of the repos**. Declare that
+mapping and every later step stays scoped.
+
+```json
+"tracker": {
+  "project_routing": {
+    "PAY": {
+      "description": "payments and billing — checkout, invoicing, the ledger",
+      "repos": ["acme/payments-api", "acme/billing-worker", "acme/webapp"],
+      "default_repo": "acme/payments-api"
+    },
+    "SEARCH": {
+      "description": "search and discovery — query service, indexing, ranking",
+      "repos": ["acme/search-service", "acme/webapp"],
+      "default_repo": "acme/search-service",
+      "status_map": { "In Review": "Code Review" },
+      "story_points_field": "customfield_10032"
+    }
+  },
+  "default_project": "PAY"
+}
+```
+
+What that buys, mechanically:
+
+- **Two-stage routing.** The foreman picks the **project** whose area matches
+  the request; triage then picks the **repo** from just that project's list
+  (an existing ticket already fixes stage one — `PAY-123` lives in `PAY`). A
+  ticket can no longer land in another team's repo because two descriptions read
+  alike, and the routing judgment is made over a handful of candidates instead
+  of the whole fleet.
+- **Per-project Jira settings.** Multi-project sites rarely share one workflow.
+  A project entry may override `status_map`, `story_points_field`, `issue_type`,
+  and `spec_approval_required`; `scripts/tracker` resolves the right one per
+  issue (from `--team`, or from the issue key's prefix), so a team-managed
+  project with its own statuses and story-points field works without breaking
+  everyone else.
+- **Deduplication across projects.** `scripts/tracker search-issues` with no
+  `--team` searches **every** routed project, so a duplicate filed in another
+  project still surfaces.
+- **Per-repo environments.** A single cloud environment cloning every repo with
+  every toolchain stops being practical past a few repos. Give a repo (or a
+  project) its own `environment_id` / `runner_id`, pass `--repo` /
+  `--issue` to `scripts/factory-dispatch`, and each child step runs where that
+  repo's `validate_command` actually works.
+- **Scoped PR probes.** `scripts/factory-state --task-id <key> --issue <key>`
+  probes only that project's repos instead of one `gh` round trip per configured
+  repo. Passing `--repo` (the repo recorded on the ticket) is better still.
+
+One repo may be listed under several projects (a shared web app is normal). A
+project with no `repos` list keeps every target repo as a candidate, which is
+exactly the single-project shape the template ships with, so existing configs
+keep working unchanged. `scripts/factory-validate-config` fails on a project
+that references an unknown repo or a `default_repo` outside its own subset, and
+warns about a repo no project can reach.
+
+At fleet scale, generate the config from whatever already knows your ownership
+(a service catalog, `CODEOWNERS`, a repo manifest):
+
+```bash
+scripts/factory-init --projects-json @projects.json --target-repos-json @repos.json \
+  --self-repo <YOUR-ORG>/factory-agents --self-project PLATFORM
+
+# later, onboard one more project/repo without rewriting the rest:
+scripts/factory-init --merge --self-repo <YOUR-ORG>/factory-agents \
+  --project "OPS=infrastructure and deploys" --project-repos "OPS=acme/terraform" \
+  --target-repo acme/terraform --target-description "infra as code" \
+  --target-base-branch main --target-validate-command "terraform validate" \
+  --target-test-guidance "terraform test under tests/"
+```
+
+`foreman/config.multi-project.example.json` is a complete worked example.
+
 ## The record vs. the conversation
 
 The ticket is always the **durable record** (description, estimate, spec PR
@@ -273,15 +356,33 @@ executable, supports `--help`, emits facts as JSON to stdout, and fails loud
   `--commit-sha <sha>` / `--commit-url <url>`; posts a markdown reply linking
   the rework commit to each thread before resolving it, touching only the
   named threads; called before re-applying the `impl-done` label.
+- `factory-config` — the **routing resolver**, and the seam every skill reads
+  config through (`show`, `projects`, `project --key/--issue`,
+  `repos --key/--issue`, `repo --repo`, `projects-for-repo --repo`). It
+  normalizes `tracker.project_routing` (a value may be a description string or
+  an object declaring that project's repo subset plus per-project overrides),
+  answers "which repos may a ticket in this project route to", resolves a
+  project's effective status map / story-points field / issue type / spec
+  approval, resolves a repo's `base_branch` / `validate_command` /
+  `test_guidance` / app-boot settings / `environment_id`, and derives the
+  repo → owning-projects reverse index. Facts only — it makes no routing
+  decision; picking the project and the repo stays the agent's judgment over the
+  narrowed candidate list.
 - `factory-state` — one JSON snapshot of a task's externally-mutable PR facts
-  (linked PR state / merge status / reviewers); when `--repo` is omitted it
-  probes every configured target repo plus `self_repo`. Tracker state is read
+  (linked PR state / merge status / reviewers). Pass `--repo` (the repo recorded
+  on the ticket) or `--project` / `--issue` to probe only the repos that Jira
+  project owns; with neither it probes every configured target repo plus
+  `self_repo`, which is one `gh` round trip per repo. Tracker state is read
   through `scripts/tracker` instead.
 - `factory-dispatch` — the foreman's dispatch **resolver**: resolve a track →
   its per-track config (skill derived from `agent.entrypoint_skill` +
-  `repos.self`, plain `model`) + the shared environment (flag →
-  `$FACTORY_FOREMAN_ENV`; unset ⇒ the child inherits the foreman's
-  environment) and compose a ready-to-use **`run_agents` tool-call payload** —
+  `repos.self`, plain `model`) + the **environment and runner for the task's
+  target repo** (`--environment`/`--runner` flag → the repo's `environment_id`
+  / `runner_id` when `--repo` is passed → the project's when `--project` /
+  `--issue` is passed or the repo has exactly one owning project →
+  `$FACTORY_FOREMAN_ENV` / `$FACTORY_FOREMAN_RUNNER`; unset ⇒ the child
+  inherits the foreman's environment) and compose a ready-to-use
+  **`run_agents` tool-call payload** —
   the foreman then dispatches the child by calling the `run_agents` tool with
   it (the script makes **no** API call). It prepends the track's
   `<track>/AGENTS.md` playbook as the shared `base_prompt` (missing/empty is a
@@ -290,7 +391,8 @@ executable, supports `--help`, emits facts as JSON to stdout, and fails loud
   `--parent-run-id` → `$CURRENT_RUN_ID` → `$OZ_RUN_ID`), names the run
   `FA_<track>_<UTC timestamp>`, enables computer use by default
   (`--no-computer-use` to opt out), and emits
-  `{track, skill, model, name, environment_id, computer_use_enabled,
+  `{track, skill, model, name, target_repo, project, environment_id,
+  environment_source, runner_id, runner_source, computer_use_enabled,
   parent_run_id, oz_web_origin, run_link_template, run_agents}` as JSON — the
   foreman substitutes the returned run id into `run_link_template` to build
   the child's Oz run link. Per-track overrides:
@@ -299,10 +401,14 @@ executable, supports `--help`, emits facts as JSON to stdout, and fails loud
   launching N Oz runs over a task list; see `evals/README.md`.
 - `factory-init` — one-time bootstrap for a new copy of the template: prompts
   for every config value (or takes flags; see `--help`), autodiscovers your
-  Jira workflow statuses and story-points field when the Jira env vars are
-  exported (soft-failing to manual values), and writes `foreman/config.json`,
-  the four track configs, and a `reviewer_overrides.json` skeleton. See
-  `SETUP.md` step 1.
+  Jira workflow statuses (per routed project) and story-points field when the
+  Jira env vars are exported (soft-failing to manual values), and writes
+  `foreman/config.json`, the four track configs, and a
+  `reviewer_overrides.json` skeleton. For many projects/repos it takes
+  `--projects-json` / `--target-repos-json` (inline JSON or `@file`) and
+  `--project-repos KEY=org/repo1,org/repo2`, and `--merge` folds a new
+  project/repo into an already-configured factory without touching the rest.
+  See `SETUP.md` step 1.
 - `factory-validate-skills` — frontmatter lint + `git diff --check` + dangling
   cross-reference scan across every agent's skills, `AGENTS.md`, and this
   README.
@@ -321,26 +427,43 @@ executable, supports `--help`, emits facts as JSON to stdout, and fails loud
 
 - `tracker.provider` — the issue-tracker provider for `scripts/tracker`
   (`"jira"`).
-- `tracker.project_routing` — map of Jira **project key** → a plain-language
-  description of the area that project owns (e.g. `"PROJ": "backend services,
-  APIs, and data pipelines"`). The agent creating a ticket picks the
-  best-matching project for the change.
+- `tracker.project_routing` — map of Jira **project key** → either a
+  plain-language description of the area that project owns (e.g.
+  `"PROJ": "backend services, APIs, and data pipelines"`) **or** an object
+  describing the project in full. The agent creating a ticket picks the
+  best-matching project for the change. The object form takes:
+  - `description` — the area text the routing judgment matches against
+    (required).
+  - `repos` — the `target_repos` keys this project owns. This is the
+    project → repos mapping that scopes repo routing for its tickets; omit it
+    to leave every target repo a candidate. A repo may be listed under several
+    projects.
+  - `default_repo` — that project's fallback repo (must be one of its `repos`).
+  - `status_map`, `story_points_field`, `issue_type`,
+    `spec_approval_required` — optional per-project overrides of the values
+    below, for a project whose Jira workflow or fields differ.
+  - `environment_id`, `runner_id` — optional per-project execution defaults
+    used when the chosen repo declares none.
 - `tracker.default_project` — the fallback project key used when routing
   finds no clear match.
 - `tracker.status_map` — maps each factory lifecycle state (`Triage`, `Todo`,
   `In Progress`, `In Review`, `Done`, `Canceled`) to the **real status name**
   in your Jira workflow. Every mapped status must exist and be reachable via
-  workflow transitions (see `SETUP.md`).
+  workflow transitions (see `SETUP.md`). This is the site-wide default; a
+  project with a different workflow overrides it in its own entry.
 - `tracker.story_points_field` — the Jira custom field id that stores story
-  points (commonly `customfield_10016`; find yours per `SETUP.md`).
+  points (commonly `customfield_10016`; find yours per `SETUP.md`). Team-managed
+  projects often use a different id — override it per project.
 - `tracker.issue_type` — the Jira issue type used for factory-created tickets
-  (e.g. `Task`).
-- `target_repos` — a map of `org/repo` → that target repo's settings. Like
-  `tracker.project_routing`, this is a thin routing table: the agent (triage)
-  matches the request against each entry's `description`, picks the repo
-  clearly responsible, and records the choice on the ticket; downstream steps
-  use the chosen repo's entry. One task normally targets **one** repo (at most
-  one PR per repo); a request spanning several repos becomes several tickets.
+  (e.g. `Task`), overridable per project.
+- `target_repos` — a map of `org/repo` → that target repo's settings, and the
+  single place a repo's mechanics are declared (a project's `repos` list only
+  *references* these keys). Like `tracker.project_routing`, it feeds a thin
+  routing table: triage matches the request against the `description` of each
+  candidate repo — the repos the ticket's project owns — picks the repo clearly
+  responsible, and records the choice on the ticket; downstream steps use the
+  chosen repo's entry. One task normally targets **one** repo (at most one PR
+  per repo); a request spanning several repos becomes several tickets.
   Each entry has:
   - `description` — a plain-language description of what that repo owns; the
     text the routing judgment matches a request against.
@@ -354,8 +477,15 @@ executable, supports `--help`, emits facts as JSON to stdout, and fails loud
     for headless repos.
   - `app_url` (optional) — the local URL the running app serves during UI
     verification (e.g. `http://localhost:8000`).
+  - `environment_id` (optional) — the Oz cloud environment that clones this
+    repo and carries its toolchain. `scripts/factory-dispatch --repo <org/repo>`
+    dispatches every child working on this repo into it, which is how a
+    many-repo factory avoids one giant environment holding every stack.
+  - `runner_id` (optional) — the Oz runner for this repo, when its build needs
+    specific compute (more memory, a different OS).
 - `default_target_repo` — the fallback `org/repo` used when no `target_repos`
-  entry clearly matches a request.
+  entry clearly matches a request and the ticket's project declares no
+  `default_repo`.
 - `spec_approval_required` — when `true` (the default), the spec step pauses
   for a human approval in the conversation before the loop advances to
   implementation; when `false`, the committed spec auto-advances with no

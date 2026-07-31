@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""factory-config -- resolve the factory's routing config deterministically.
+
+One read-only entrypoint over `foreman/config.json` so skills never hand-parse
+it. It answers the questions the loop actually asks at scale (many Jira
+projects, many repos):
+
+  * which Jira projects exist, and what does each own?
+  * which target repos may a ticket in project X route to (the project's repo
+    SUBSET) and which is that project's fallback?
+  * what are the effective tracker settings for project X (status map, story
+    points field, issue type, spec approval) after per-project overrides?
+  * what are repo R's settings (base branch, validation gate, test guidance,
+    app boot) plus its resolved cloud environment / runner?
+  * which projects own repo R (the derived reverse index)?
+
+It contains NO routing JUDGMENT. Choosing the project for a request, and the
+repo within that project's subset, stays an agent decision (factory-triage /
+factory-foreman); this script only narrows the candidate set and resolves
+settings, so the judgment happens over a small, correct list instead of every
+repo in the org.
+
+Config shape (backwards compatible)
+-----------------------------------
+`tracker.project_routing` maps a Jira project key to EITHER
+
+  "PAY": "payments, billing, invoicing"           (string; description only)
+
+or an object that also declares the project's repo subset and any per-project
+tracker overrides:
+
+  "PAY": {
+    "description": "payments, billing, invoicing",
+    "repos": ["acme/payments-api", "acme/billing-worker"],
+    "default_repo": "acme/payments-api",
+    "status_map": {"In Review": "Code Review"},
+    "story_points_field": "customfield_10032",
+    "issue_type": "Bug",
+    "spec_approval_required": false,
+    "environment_id": "...",
+    "runner_id": "..."
+  }
+
+The string form (and a project with no `repos`) means "every target repo is a
+candidate", which is exactly the single-project behavior the template shipped
+with. Repo settings always live in `target_repos` -- a project only REFERENCES
+repo keys, so a repo shared by several projects is declared once and may be
+listed under each project that owns work in it.
+
+Subcommands (all emit JSON to stdout; all fail loud on bad input):
+  show               the whole normalized config
+  projects           every project's key, description, repo subset, fallback
+  project            one project's effective settings (--key or --issue)
+  repos              the repo CANDIDATES for a project (--key/--issue), with
+                     each candidate's description for the routing judgment
+  repo               one repo's settings + owning projects + environment
+  projects-for-repo  the reverse index for a repo
+
+No third-party dependencies; Python 3 stdlib only.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# Per-project keys that override the site-wide `tracker` defaults.
+PROJECT_OVERRIDE_FIELDS = (
+    "status_map",
+    "story_points_field",
+    "issue_type",
+    "spec_approval_required",
+    "environment_id",
+    "runner_id",
+)
+
+# Repo-level execution settings (everything else in a target_repos entry
+# describes the repo itself and is passed through untouched).
+REPO_EXECUTION_FIELDS = ("environment_id", "runner_id")
+
+
+def _die(msg):
+    sys.stderr.write(f"factory-config: {msg.rstrip()}\n")
+    sys.exit(1)
+
+
+def load_foreman_config(repo_root):
+    path = os.path.join(repo_root, "foreman", "config.json")
+    if not os.path.isfile(path):
+        _die(f"missing foreman config: {path}")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        _die(f"could not read {path}: {e}")
+    if not isinstance(data, dict):
+        _die(f"{path} must be a JSON object")
+    return data
+
+
+def project_key_from_issue(issue_key):
+    """The Jira project key of an issue key (PAY-123 -> PAY); '' when unclear."""
+    text = (issue_key or "").strip()
+    if not text:
+        return ""
+    if "-" in text:
+        text = text.rsplit("-", 1)[0]
+    return text.strip().upper()
+
+
+def _as_project_entry(key, raw):
+    """Normalize a project_routing value (string or object) to a dict."""
+    if isinstance(raw, str):
+        return {"key": key, "description": raw, "repos": [], "default_repo": None}
+    if not isinstance(raw, dict):
+        _die(f"tracker.project_routing[{key!r}] must be a string or an object")
+    entry = {
+        "key": key,
+        "description": raw.get("description") or "",
+        "repos": [r for r in (raw.get("repos") or []) if isinstance(r, str) and r],
+        "default_repo": raw.get("default_repo") or None,
+    }
+    for field in PROJECT_OVERRIDE_FIELDS:
+        if field in raw:
+            entry[field] = raw[field]
+    return entry
+
+
+def normalize(config):
+    """The resolved view of the config every subcommand answers from."""
+    tracker = config.get("tracker") if isinstance(config.get("tracker"), dict) else {}
+    routing = tracker.get("project_routing")
+    routing = routing if isinstance(routing, dict) else {}
+    target_repos = config.get("target_repos")
+    target_repos = target_repos if isinstance(target_repos, dict) else {}
+
+    projects = {}
+    for key, raw in routing.items():
+        projects[key] = _as_project_entry(key, raw)
+
+    return {
+        "tracker": {
+            "provider": tracker.get("provider"),
+            "browse_url": tracker.get("browse_url"),
+            "default_project": tracker.get("default_project"),
+            "status_map": tracker.get("status_map")
+            if isinstance(tracker.get("status_map"), dict) else {},
+            "story_points_field": tracker.get("story_points_field"),
+            "issue_type": tracker.get("issue_type"),
+        },
+        "projects": projects,
+        "target_repos": target_repos,
+        "default_target_repo": config.get("default_target_repo"),
+        "spec_approval_required": config.get("spec_approval_required"),
+        "self_repo": config.get("self_repo"),
+        "self_project": config.get("self_project"),
+    }
+
+
+def project_repo_keys(norm, project_key):
+    """The repo candidates for a project (its subset, else every target repo)."""
+    entry = norm["projects"].get(project_key)
+    declared = list(entry.get("repos") or []) if entry else []
+    known = list(norm["target_repos"].keys())
+    if not declared:
+        return known
+    # Keep declaration order, drop entries that are not real target repos
+    # (factory-validate-config reports those as errors).
+    return [repo for repo in declared if repo in norm["target_repos"]]
+
+
+def project_default_repo(norm, project_key):
+    """The repo a project falls back to when no candidate clearly matches."""
+    entry = norm["projects"].get(project_key) or {}
+    candidates = project_repo_keys(norm, project_key)
+    declared = entry.get("default_repo")
+    if declared and declared in candidates:
+        return declared
+    global_default = norm.get("default_target_repo")
+    if global_default and global_default in candidates:
+        return global_default
+    return candidates[0] if candidates else None
+
+
+def effective_project(norm, project_key):
+    """A project's effective settings after per-project overrides."""
+    entry = norm["projects"].get(project_key)
+    tracker = norm["tracker"]
+    configured = entry is not None
+    entry = entry or {"key": project_key, "description": "", "repos": [],
+                      "default_repo": None}
+
+    status_map = dict(tracker.get("status_map") or {})
+    if isinstance(entry.get("status_map"), dict):
+        status_map.update(entry["status_map"])
+
+    story_points = (
+        entry["story_points_field"] if "story_points_field" in entry
+        else tracker.get("story_points_field")
+    )
+    issue_type = entry.get("issue_type") or tracker.get("issue_type")
+    spec_approval = (
+        entry["spec_approval_required"] if "spec_approval_required" in entry
+        else norm.get("spec_approval_required")
+    )
+
+    return {
+        "key": project_key,
+        "configured": configured,
+        "description": entry.get("description") or "",
+        "repos": project_repo_keys(norm, project_key),
+        "default_repo": project_default_repo(norm, project_key),
+        "scoped_repos": bool(entry.get("repos")),
+        "status_map": status_map,
+        "story_points_field": story_points,
+        "issue_type": issue_type,
+        "spec_approval_required": spec_approval,
+        "environment_id": entry.get("environment_id"),
+        "runner_id": entry.get("runner_id"),
+    }
+
+
+def projects_for_repo(norm, repo):
+    """Every project that owns this repo (the derived reverse index).
+
+    When any project declares a `repos` subset, ownership is explicit and only
+    the projects that list the repo are returned. When no project declares a
+    subset at all (the single-project template shape), every project can route
+    to every repo, so every project is returned.
+    """
+    scoped = [key for key, entry in norm["projects"].items() if entry.get("repos")]
+    keys = scoped if scoped else list(norm["projects"])
+    return [key for key in keys if repo in project_repo_keys(norm, key)]
+
+
+def effective_repo(norm, repo, project_key=None):
+    """A repo's settings plus its owning projects and resolved execution env."""
+    entry = norm["target_repos"].get(repo)
+    if entry is None:
+        _die(
+            f"unknown target repo {repo!r}; configured target repos are: "
+            + (", ".join(norm["target_repos"]) or "(none)")
+        )
+    if not isinstance(entry, dict):
+        _die(f"target_repos[{repo!r}] must be an object")
+
+    owners = projects_for_repo(norm, repo)
+    project = None
+    if project_key:
+        project = effective_project(norm, project_key)
+    elif len(owners) == 1:
+        project = effective_project(norm, owners[0])
+
+    resolved = {"repo": repo, "projects": owners}
+    for key, value in entry.items():
+        resolved[key] = value
+    for field in REPO_EXECUTION_FIELDS:
+        value = entry.get(field)
+        if not value and project:
+            value = project.get(field)
+        resolved[field] = value or None
+    resolved["spec_approval_required"] = (
+        project["spec_approval_required"] if project
+        else norm.get("spec_approval_required")
+    )
+    resolved["project"] = project["key"] if project else None
+    return resolved
+
+
+def _resolve_project_key(norm, args, allow_default=True):
+    """The project key from --key / --issue, falling back to default_project."""
+    if getattr(args, "key", None):
+        return args.key.strip().upper()
+    if getattr(args, "issue", None):
+        derived = project_key_from_issue(args.issue)
+        if derived:
+            return derived
+    if allow_default:
+        default = norm["tracker"].get("default_project")
+        if default:
+            return default
+    return None
+
+
+def cmd_show(norm, args):
+    print(json.dumps(norm, indent=2))
+    return 0
+
+
+def cmd_projects(norm, args):
+    out = [effective_project(norm, key) for key in norm["projects"]]
+    print(json.dumps({
+        "default_project": norm["tracker"].get("default_project"),
+        "self_project": norm.get("self_project"),
+        "projects": out,
+    }, indent=2))
+    return 0
+
+
+def cmd_project(norm, args):
+    key = _resolve_project_key(norm, args)
+    if not key:
+        _die("no project resolved: pass --key or --issue, or set "
+             "tracker.default_project in foreman/config.json")
+    resolved = effective_project(norm, key)
+    if not resolved["configured"]:
+        sys.stderr.write(
+            f"factory-config: warning: project {key!r} is not in "
+            "tracker.project_routing; using site-wide tracker defaults\n"
+        )
+    print(json.dumps(resolved, indent=2))
+    return 0
+
+
+def cmd_repos(norm, args):
+    key = _resolve_project_key(norm, args)
+    candidates = []
+    for repo in (project_repo_keys(norm, key) if key
+                 else list(norm["target_repos"].keys())):
+        entry = norm["target_repos"].get(repo) or {}
+        candidates.append({
+            "repo": repo,
+            "description": entry.get("description"),
+            "base_branch": entry.get("base_branch"),
+        })
+    print(json.dumps({
+        "project": key,
+        "scoped": bool(key and (norm["projects"].get(key) or {}).get("repos")),
+        "default_repo": project_default_repo(norm, key) if key
+        else norm.get("default_target_repo"),
+        "repos": candidates,
+    }, indent=2))
+    return 0
+
+
+def cmd_repo(norm, args):
+    key = None
+    if getattr(args, "key", None) or getattr(args, "issue", None):
+        key = _resolve_project_key(norm, args, allow_default=False)
+    print(json.dumps(effective_repo(norm, args.repo.strip(), key), indent=2))
+    return 0
+
+
+def cmd_projects_for_repo(norm, args):
+    repo = args.repo.strip()
+    if repo not in norm["target_repos"]:
+        _die(f"unknown target repo {repo!r}")
+    print(json.dumps({
+        "repo": repo,
+        "projects": projects_for_repo(norm, repo),
+    }, indent=2))
+    return 0
+
+
+def _add_project_selectors(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--key", help="Jira project key, e.g. PAY.")
+    group.add_argument(
+        "--issue",
+        help="Issue key (e.g. PAY-123); the project is taken from its prefix.",
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="factory-config",
+        description=(
+            "Resolve the factory's routing config (foreman/config.json): the "
+            "Jira projects, each project's target-repo subset and fallback, the "
+            "effective per-project tracker settings, and each repo's settings, "
+            "owning projects, and cloud environment. Facts only -- it makes no "
+            "routing decisions."
+        ),
+    )
+    parser.add_argument("--repo-root", default=DEFAULT_REPO_ROOT,
+                        help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_show = sub.add_parser("show", help="Print the whole normalized config.")
+    p_show.set_defaults(func=cmd_show)
+
+    p_projects = sub.add_parser(
+        "projects",
+        help="List every routed project with its repo subset and fallback.",
+    )
+    p_projects.set_defaults(func=cmd_projects)
+
+    p_project = sub.add_parser(
+        "project",
+        help=(
+            "One project's effective settings (repo subset, status map, story "
+            "points field, issue type, spec approval)."
+        ),
+    )
+    _add_project_selectors(p_project)
+    p_project.set_defaults(func=cmd_project)
+
+    p_repos = sub.add_parser(
+        "repos",
+        help=(
+            "The target-repo candidates a ticket in this project may route to, "
+            "with each candidate's description for the routing judgment."
+        ),
+    )
+    _add_project_selectors(p_repos)
+    p_repos.set_defaults(func=cmd_repos)
+
+    p_repo = sub.add_parser(
+        "repo",
+        help=(
+            "One target repo's settings (base branch, validation gate, test "
+            "guidance, app boot) plus its owning projects and resolved "
+            "environment / runner."
+        ),
+    )
+    p_repo.add_argument("--repo", required=True, metavar="ORG/REPO",
+                        help="Target repo key, e.g. acme/payments-api.")
+    _add_project_selectors(p_repo)
+    p_repo.set_defaults(func=cmd_repo)
+
+    p_reverse = sub.add_parser(
+        "projects-for-repo",
+        help="The projects that own a repo (the derived reverse index).",
+    )
+    p_reverse.add_argument("--repo", required=True, metavar="ORG/REPO",
+                           help="Target repo key, e.g. acme/payments-api.")
+    p_reverse.set_defaults(func=cmd_projects_for_repo)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    norm = normalize(load_foreman_config(args.repo_root))
+    return args.func(norm, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,85 @@
+{
+  "_comment": "A worked example of foreman/config.json for a team with SEVERAL Jira projects and MANY repos. Each project_routing value is an object that declares the repos that project owns, so a ticket in PAY can only route to payments repos; per-project status_map / story_points_field / issue_type overrides handle projects whose Jira workflow differs (team-managed projects each get their own story-points field); per-repo environment_id sends each child run into the cloud environment that actually has that repo's toolchain. Generate this file from your own source of truth with 'scripts/factory-init --projects-json @projects.json --target-repos-json @repos.json', and onboard one more project or repo later with --merge. Use foreman/config.example.json instead for the simpler single-repo setup.",
+  "tracker": {
+    "provider": "jira",
+    "browse_url": "https://yourcompany.atlassian.net",
+    "project_routing": {
+      "PAY": {
+        "description": "Payments and billing — checkout, subscriptions, invoicing, payment-provider integrations, and the billing ledger.",
+        "repos": ["acme/payments-api", "acme/billing-worker", "acme/webapp"],
+        "default_repo": "acme/payments-api"
+      },
+      "SEARCH": {
+        "description": "Search and discovery — the query service, the indexing pipeline, ranking, and the search UI.",
+        "repos": ["acme/search-service", "acme/webapp"],
+        "default_repo": "acme/search-service",
+        "status_map": {
+          "In Review": "Code Review",
+          "Canceled": "Won't Do"
+        },
+        "story_points_field": "customfield_10032",
+        "issue_type": "Bug",
+        "spec_approval_required": false
+      },
+      "PLATFORM": {
+        "description": "Developer platform — CI, build tooling, shared libraries, and the factory agents' own playbook.",
+        "repos": ["acme/build-tools"],
+        "default_repo": "acme/build-tools"
+      }
+    },
+    "default_project": "PAY",
+    "status_map": {
+      "Triage": "To Do",
+      "Todo": "To Do",
+      "In Progress": "In Progress",
+      "In Review": "In Review",
+      "Done": "Done",
+      "Canceled": "Done"
+    },
+    "story_points_field": "customfield_10016",
+    "issue_type": "Task"
+  },
+  "target_repos": {
+    "acme/payments-api": {
+      "description": "Payments API — Python/FastAPI service owning charges, refunds, and provider webhooks.",
+      "base_branch": "main",
+      "validate_command": "make lint && make test",
+      "test_guidance": "pytest; tests live next to the code in tests/test_*.py — add a failing-then-passing test, run it scoped, then the full gate.",
+      "environment_id": "REPLACE_ME - environment id that clones acme/payments-api with Python + uv"
+    },
+    "acme/billing-worker": {
+      "description": "Billing worker — Go service that runs invoicing jobs and the billing ledger reconciliation.",
+      "base_branch": "main",
+      "validate_command": "make check",
+      "test_guidance": "go test ./... ; table-driven tests live beside the package — add the failing case first.",
+      "environment_id": "REPLACE_ME - environment id that clones acme/billing-worker with Go"
+    },
+    "acme/search-service": {
+      "description": "Search service — Rust query and indexing service behind the search API.",
+      "base_branch": "main",
+      "validate_command": "cargo fmt --check && cargo clippy -- -D warnings && cargo test",
+      "test_guidance": "cargo test; integration tests live in tests/ — add the failing case, run it scoped, then the full gate.",
+      "environment_id": "REPLACE_ME - environment id that clones acme/search-service with the Rust toolchain",
+      "runner_id": "REPLACE_ME - a larger runner; the Rust build needs the memory"
+    },
+    "acme/webapp": {
+      "description": "Web app — TypeScript/React front end shared by several teams (checkout screens for PAY, results screens for SEARCH).",
+      "base_branch": "main",
+      "validate_command": "npm run lint && npm test",
+      "test_guidance": "vitest; component tests live beside the component as *.test.tsx — add the failing assertion first.",
+      "app_start_command": "npm ci && npm run dev",
+      "app_url": "http://localhost:3000",
+      "environment_id": "REPLACE_ME - environment id that clones acme/webapp with Node"
+    },
+    "acme/build-tools": {
+      "description": "Build tooling — shared CI actions, lint configs, and release scripts.",
+      "base_branch": "main",
+      "validate_command": "./scripts/ci",
+      "test_guidance": "bats tests under tests/ — add the failing case first, then run ./scripts/ci."
+    }
+  },
+  "default_target_repo": "acme/webapp",
+  "spec_approval_required": true,
+  "self_repo": "your-org/factory-agents",
+  "self_project": "PLATFORM"
+}

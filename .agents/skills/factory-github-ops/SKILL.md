@@ -27,9 +27,12 @@ Which repo you target depends on the **track** (`factory-triage` decides):
 - **Target-repo track** (bug reports / features → `factory-spec` +
   `factory-implement`):
   - **Repo:** the task's target repo — the repo triage chose and recorded on
-    the ticket (its entry in config `target_repos` in `foreman/config.json`).
-  - **Base branch:** the chosen repo's `base_branch` (from its `target_repos`
-    entry).
+    the ticket (its `Target repo` line). Triage picked it from the repos the
+    ticket's Jira project owns, so treat it as decided; resolve that repo's
+    settings with `scripts/factory-config repo --repo <org/repo>` instead of
+    re-reading `foreman/config.json`.
+  - **Base branch:** the chosen repo's `base_branch` (from the same resolver
+    call — repos differ, e.g. `main` in one and `master` in another).
   - **Branch naming:** `factory/<short-slug>`. **This branch/PR is shared across
     the spec and implementation phases:** `factory-spec` creates the branch,
     commits the spec as one markdown file under `agents/specs/` named
@@ -112,11 +115,16 @@ shape:
 - **Find** the task's PR when you don't already know it. It reads PR bodies in
   the named repo and matches `task_id`, so always disambiguate by
   **(task_id, repo)**. A task has at most one PR per repo. Pass the task's
-  chosen/recorded target repo (or `self_repo` for the self-skills track); when
-  the target repo is unknown, iterate the configured `target_repos` entries:
+  chosen/recorded target repo (or `self_repo` for the self-skills track):
   ```bash
   scripts/factory-pr-meta find --task-id <key> --repo <owner/repo>
   ```
+  When the target repo is genuinely unknown, do **not** sweep every configured
+  repo — that is one API round trip per repo and gets slow and rate-limited at
+  scale. Narrow first to the repos the ticket's project owns
+  (`scripts/factory-config repos --issue <key>`) and iterate only those, or let
+  `scripts/factory-state --task-id <key> --issue <key>` do the scoped probe for
+  you.
   Prints `{number,url,state,headRefName,merged,reviewers,ci_fix_attempts}` for
   the match, or nothing when the task has no PR in that repo.
 - **Verify** exactly one valid block is present before trusting a PR — a missing

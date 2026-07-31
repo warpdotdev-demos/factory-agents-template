@@ -52,14 +52,20 @@ REFERENCE_ALLOWLIST = {
 # them as valid even when a given worktree hasn't materialized every script yet
 # (the scan's job is to catch dangling *skill* references, not absent siblings).
 KNOWN_SCRIPTS = {
+    "factory-config",
+    "factory-dispatch",
+    "factory-init",
     "factory-pr-meta",
     "factory-resolve-reviewer",
+    "factory-resolve-threads",
     "factory-state",
+    "factory-validate-config",
     "factory-validate-skills",
     "check",
     "forge",
     "github",
     "mock-code-forge",
+    "mock-issue-tracker",
 }
 
 

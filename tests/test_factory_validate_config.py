@@ -160,6 +160,155 @@ class StructuralErrorTest(unittest.TestCase):
                                 for e in result["errors"]))
 
 
+def multi_project_foreman():
+    """A two-project config whose projects each own a repo subset."""
+    foreman = copy.deepcopy(VALID_FOREMAN)
+    foreman["tracker"]["project_routing"] = {
+        "PAY": {
+            "description": "payments and billing",
+            "repos": ["acme/webapp", "acme/payments-api"],
+            "default_repo": "acme/payments-api",
+        },
+        "SEARCH": {
+            "description": "search and discovery",
+            "repos": ["acme/webapp"],
+            "status_map": {"In Review": "Code Review"},
+            "story_points_field": "customfield_10032",
+            "issue_type": "Bug",
+            "spec_approval_required": False,
+            "environment_id": "env-search",
+        },
+    }
+    foreman["tracker"]["default_project"] = "PAY"
+    foreman["self_project"] = "PAY"
+    foreman["target_repos"]["acme/payments-api"] = {
+        "description": "the payments API",
+        "base_branch": "main",
+        "validate_command": "make check",
+        "test_guidance": "pytest under tests/",
+        "environment_id": "env-payments",
+        "runner_id": "runner-payments",
+    }
+    return foreman
+
+
+class ProjectRoutingTest(unittest.TestCase):
+    def test_multi_project_config_with_repo_subsets_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_configs(root, foreman=multi_project_foreman())
+            code, result = run_validate(root)
+            self.assertEqual(code, 0, result["errors"])
+            self.assertEqual(result["errors"], [])
+
+    def test_project_referencing_unknown_repo_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["PAY"]["repos"].append("acme/ghost")
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 1)
+            self.assertTrue(any("acme/ghost" in e for e in result["errors"]))
+
+    def test_default_repo_outside_project_subset_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["SEARCH"]["default_repo"] = \
+                "acme/payments-api"
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 1)
+            self.assertTrue(any("default_repo" in e for e in result["errors"]))
+
+    def test_unroutable_repo_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["target_repos"]["acme/orphan"] = {
+                "description": "nobody owns me",
+                "base_branch": "main",
+                "validate_command": "make check",
+                "test_guidance": "pytest",
+            }
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(any("acme/orphan" in w for w in result["warnings"]))
+
+    def test_unscoped_project_alongside_scoped_ones_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["PLATFORM"] = "the platform"
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(any("PLATFORM" in w for w in result["warnings"]))
+
+    def test_several_unscoped_projects_warn(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = copy.deepcopy(VALID_FOREMAN)
+            foreman["tracker"]["project_routing"] = {
+                "ENG": "backend services",
+                "WEB": "the web app",
+            }
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(any("none declares" in w for w in result["warnings"]))
+
+    def test_project_status_map_with_unknown_state_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["SEARCH"]["status_map"] = \
+                {"Bogus": "Whatever"}
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 1)
+            self.assertTrue(any("Bogus" in e for e in result["errors"]))
+
+    def test_project_missing_description_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            del foreman["tracker"]["project_routing"]["PAY"]["description"]
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 1)
+            self.assertTrue(any("description" in e for e in result["errors"]))
+
+    def test_unknown_project_field_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["PAY"]["bogus"] = "x"
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(any("bogus" in w for w in result["warnings"]))
+
+    def test_non_boolean_project_spec_approval_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["tracker"]["project_routing"]["SEARCH"][
+                "spec_approval_required"] = "yes"
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 1)
+
+    def test_self_project_outside_routing_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            foreman["self_project"] = "PLATFORM"
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertTrue(any("self_project" in w for w in result["warnings"]))
+
+    def test_repo_execution_fields_are_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            foreman = multi_project_foreman()
+            write_configs(root, foreman=foreman)
+            code, result = run_validate(root)
+            self.assertEqual(code, 0)
+            self.assertFalse(any("environment_id" in w for w in result["warnings"]))
+
+
 class ConsistencyTest(unittest.TestCase):
     def test_mismatched_repos_self_fails(self):
         with tempfile.TemporaryDirectory() as root:

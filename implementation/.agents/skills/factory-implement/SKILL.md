@@ -31,9 +31,16 @@ Keep the task's **live status comment** current and status posts terse per
 `factory-progress-updates`. Read/post the task through `factory-tracker-ops`; use
 `factory-github-ops` for PR mechanics and `factory-verification` for the
 validation mandate. The task's target repo is the repo triage recorded on the
-ticket (the `Target repo: <org/repo>` line, also usually in your brief); read
-its `base_branch`, `validate_command`, and `test_guidance` from its entry in
-`target_repos` in `foreman/config.json`.
+ticket (the `Target repo: <org/repo>` line, also usually in your brief); resolve
+its `base_branch`, `validate_command`, `test_guidance`, and app-boot settings
+with one call rather than reading the config by hand:
+
+```bash
+scripts/factory-config repo --repo <task's target repo>
+```
+
+Do **not** substitute a different repo, and do not reuse another repo's gate or
+test conventions — with many repos configured, each one has its own.
 
 ## Step 0 — Locate the ticket, then gate on the label
 
@@ -53,7 +60,7 @@ Establish the task_id in this order:
 
 Then trust your run's conversation history for what you've already done, and
 re-derive externally-mutable facts:
-- PR facts via `scripts/factory-state --task-id <task_id> --repo <task's target repo>` (the repo recorded on the ticket; omit `--repo` to probe all configured target repos plus `self_repo`).
+- PR facts via `scripts/factory-state --task-id <task_id> --repo <task's target repo>` (the repo recorded on the ticket). When the ticket somehow records no target repo, pass `--issue <task_id>` so the probe covers only that project's repos plus `self_repo` instead of every configured repo.
 - The linked issue's **labels** and newest comments via `factory-tracker-ops`.
 
 **Gate on `spec-done` or `blocked`** (per the gating rule in
@@ -234,7 +241,7 @@ Before opening or marking any PR ready, prove the defect is gone deterministical
    for the language/framework.
 2. **Run the gate** from the repo root — the target repo's validation gate:
    ```bash
-   <the target repo's validate_command from its target_repos entry in foreman/config.json>
+   <the target repo's validate_command, from scripts/factory-config repo --repo <task's target repo>>
    ```
    It must pass (formatting, linting, tests, build — exact tools vary by repo;
    consult the command's script or the repo's README). For a faster inner loop
