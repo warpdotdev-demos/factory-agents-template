@@ -103,8 +103,10 @@ Per agent:
   and recording the choice on the ticket), files/enriches the Jira ticket,
   reproduces **non-trivial** bugs,
   evaluates complexity, then applies triage's completion label (`spec-done` or
-  `triage-done`), sets status **Todo**, records the story-point estimate,
-  reports to the foreman, and ends.
+  `triage-done`) — **defaulting to `spec-done`, no spec**, and requiring a spec
+  only when both significant product ambiguity and material technical
+  complexity are present — sets status **Todo**, records the story-point
+  estimate, reports to the foreman, and ends.
   Skills: `factory-triage`, `evaluate-complexity`.
 - **spec** — owns spec writing only. Gates on `triage-done`, reads state,
   takes ownership, writes the spec directly, scales the spec's depth to the
@@ -159,9 +161,11 @@ request (Slack / Jira / direct prompt)
    ◀─ step result + artifacts; auto-advances to the next step by default
 
 triage ──┬─ unclear ──────────▶ ask in the conversation, END
-         ├─ obvious & safe ────▶ label `spec-done`   (spec skipped; auto ─▶ implementation)
+         ├─ no spec (default) ─▶ label `spec-done`   (spec skipped; auto ─▶ implementation)
          ├─ self-skills ───────▶ label `spec-done`   (auto ─▶ implementation)
-         └─ non-obvious ───────▶ label `triage-done` (auto ─▶ spec)
+         └─ spec (uncommon) ───▶ label `triage-done` (auto ─▶ spec)
+            (only when BOTH significant product ambiguity AND material
+             technical complexity are present)
 spec ─▶ commit spec to draft PR ─▶ approved ─▶ label `spec-done` (auto ─▶ implementation, reusing the same PR)
         (when `spec_approval_required` is false the approval pause is skipped:
          the committed spec advances straight into implementation)

@@ -12,6 +12,10 @@ from its `target_repos` entry, plus the rule that user-facing changes need
 visual proof). This skill owns the **mechanics of capturing that visual proof**
 and surfacing it to the user.
 
+Lifecycle status and gate-label meanings live in `factory-tracker-ops`; this
+skill references them only when describing visual-proof requirements for the
+implementation and rework paths.
+
 ## Trigger
 
 Invoke this skill after implementation is complete, **whenever the change is
@@ -122,6 +126,12 @@ GitHub release download URL using the markdown image syntax shown below.
 ```markdown
 ![Caption describing the UI state](https://github.com/<owner>/<repo>/releases/download/visual-proof-<ticket-id>/<filename>.png)
 ```
+
+The four steps above are the path for **screenshots**. For a **video / screen
+recording**, rely on the platform's own computer-use artifact flow to surface the
+recording on the PR rather than hand-rolling a video host or packing a recording
+into a release asset; if no such flow is available in your environment, fall back
+to screenshots at each key state.
 
 No tool is a substitute for a real repro on the changed path. Capture the actual
 rendered surface, not a mockup or static image from design.

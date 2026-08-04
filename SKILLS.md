@@ -36,7 +36,7 @@ template is stable-only).
 | Skill | Primary use case | Description |
 | --- | --- | --- |
 | `factory-triage` | Triage entry | Run FIRST on every triage task: derive state, classify, choose the target repo (matching the request against the config `target_repos` descriptions, falling back to `default_target_repo`, and recording the choice on the ticket), file/enrich a Jira issue (project routing + issue type), reproduce **non-trivial** bugs, assess complexity/size, then set status **Todo**, set the story-point estimate, apply triage's completion label (`spec-done` or `triage-done`), report to the foreman, and end. (`triage/.agents/skills/factory-triage/SKILL.md`) |
-| `evaluate-complexity` | Triage complexity decision | Judge obvious-and-safe vs non-obvious by root-cause certainty, blast radius, ambiguity, and size; output the completion label triage should apply (`spec-done` or `triage-done`) plus the story-point estimate (XS=1, S=2, M=3, L=5, XL=8). (`triage/.agents/skills/evaluate-complexity/SKILL.md`) |
+| `evaluate-complexity` | Triage complexity decision | Judge whether a spec would add real value and choose the ticket's story-point estimate (XS=1, S=2, M=3, L=5, XL=8). **The default is no spec** — apply `spec-done` and go straight to implementation; require a spec (`triage-done`) sparingly and only when BOTH significant product ambiguity AND material technical complexity are present. (`triage/.agents/skills/evaluate-complexity/SKILL.md`) |
 
 ## Spec agent — `spec/.agents/skills/`
 

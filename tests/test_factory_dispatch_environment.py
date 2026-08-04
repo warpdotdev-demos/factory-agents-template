@@ -176,7 +176,6 @@ class ProjectKeyFromIssueTest(unittest.TestCase):
 class PayloadTest(unittest.TestCase):
     def test_remote_carries_environment_and_runner_when_resolved(self):
         payload = dispatch._build_run_agents_payload(
-            "org/repo:triage/.agents/skills/factory-triage/SKILL.md",
             "base", "prompt", "auto", "env-1", "FA_triage_x", "triage", True,
             "runner-1",
         )
@@ -185,7 +184,6 @@ class PayloadTest(unittest.TestCase):
 
     def test_remote_omits_unresolved_execution_settings(self):
         payload = dispatch._build_run_agents_payload(
-            "org/repo:triage/.agents/skills/factory-triage/SKILL.md",
             "base", "prompt", None, None, "FA_triage_x", "triage", True, None,
         )
         self.assertNotIn("environment_id", payload["remote"])

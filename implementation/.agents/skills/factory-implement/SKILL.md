@@ -252,9 +252,9 @@ Before opening or marking any PR ready, prove the defect is gone deterministical
    this is not optional.** If the change has an observable UI effect (per
    `factory-verification`), additionally exercise it through the running UI with
    the **computer use** tool
-   and **capture before/after screenshots** of the rendered surface. Factory
-   child runs are dispatched **with computer use enabled**, so "the tool wasn't
-available" is not a valid reason to skip this.
+   and **capture before/after screenshots or video** of the rendered surface.
+   Factory child runs are dispatched **with computer use enabled**, so "the tool
+   wasn't available" is not a valid reason to skip this.
   Follow the exact mechanics in `factory-ui-verification` (§ How to capture):
   **(1)** start the application server in the background before the session —
   run the target repo's `app_start_command` and use its `app_url` (both from
@@ -271,11 +271,13 @@ available" is not a valid reason to skip this.
   download URLs as markdown images (`![caption](url)`) in both the PR body and the
   task record. A textual description of what the subagent observed is **not**
   sufficient visual proof — the reviewer cannot see your description as an image.
+  For a **video / screen recording**, use the platform's computer-use artifact
+  flow to surface the recording instead of steps (3)–(4)'s screenshot upload path.
   **Attach that proof to the
-  task's record now** — embed the screenshots in your progress update via
-  `factory-tracker-ops` so the record carries the visual evidence — and
-  carry the same images forward to embed in the PR body in Step 6. These
-  screenshots are **attached to the task record and PR body only — never
+  task's record now** — embed the screenshots or video link in your progress
+  update via `factory-tracker-ops` so the record carries the visual evidence — and
+  carry the same proof forward to embed in the PR body in Step 6. Visual proof is
+  **attached to the task record and PR body only — never
   committed to the branch** (see Step 3). A user-facing
    change with no visual proof is **unverified**: do **not** open the PR or report
    completion claiming it is done, and do **not** quietly report success on the
@@ -337,9 +339,10 @@ scripts/factory-pr-meta build --task-id <key> --task-source <jira|github|prompt>
 
 **For a user-facing change, embed the screenshots / visual proof** captured in
 Step 4 in the PR body (the same proof posted to the task) by
-uploading/referencing the images in the body — **not** by committing them to the
-branch (see Step 3) — so the reviewer sees the validated behavior without
-re-running anything — per `factory-verification`. Confirm the diff contains only
+uploading/referencing the images or video in the body — **not** by committing them
+to the branch (see Step 3) — so the reviewer sees the validated behavior without
+re-running anything — per `factory-verification` and `factory-ui-verification`.
+Confirm the diff contains only
 the source, test, and committed-spec files (no testing or verification
 artifacts) before the PR goes ready for review. Include the co-author trailer
 per `factory-github-ops`. Whether you reused or

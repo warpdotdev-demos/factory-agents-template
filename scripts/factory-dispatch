@@ -37,9 +37,12 @@ Resolution order for skill (per track), first wins:
      hyphens -> underscores, e.g. code-review -> CODE_REVIEW)
   3. derived from <track>/config.json:
      <repos.self>:<track>/.agents/skills/<agent.entrypoint_skill>/SKILL.md
-The resolved skill is emitted as a `run_agents` skills[] entry (a
-repository-qualified `org/repo:path/to/SKILL.md` spec) so the tool attaches it
-to the child; the child brief also names it as the entry point to read first.
+The resolved skill is named in the shared `run_agents` base_prompt as an
+absolute path rooted at this repo checkout so the child can read it from any
+cwd. The payload intentionally omits `skills[]` — attaching a repo-qualified
+`org/repo:path/to/SKILL.md` skill spec fails on first try in cloud environments
+that only accept absolute filesystem skill paths (or cannot resolve the repo
+spec until retried). Pointing the child at the checkout path works first try.
 
 Resolution order for model (per track, optional), first wins:
   1. explicit flag (--model)
@@ -102,12 +105,11 @@ A still-unresolved (or placeholder REPLACE_ME) skill or parent run id fails
 loudly with the flag/env-var to set. model and environment_id are optional; if
 unresolved, the tool's own defaults apply.
 
-The child brief is PREPENDED with the track's standing playbook
-(<track>/AGENTS.md) so the child receives its full track role/playbook in
-addition to the foreman's brief handoff description. A missing or empty AGENTS.md
-is a non-fatal warning; the brief alone still dispatches. The playbook is emitted
-as the shared `run_agents` base_prompt (prepended to every child prompt); the
-task brief + coordination footer are emitted as the per-child prompt.
+The shared `run_agents` base_prompt is a short pointer that names the track
+playbook path (<track>/AGENTS.md) and entry skill path as absolute paths so the
+child reads them from the checkout — the full AGENTS.md body is NOT inlined. A
+missing AGENTS.md is a non-fatal warning; the pointer still names the entry
+skill. The task brief + coordination footer are emitted as the per-child prompt.
 
 The child brief is suffixed with a deterministic COORDINATION FOOTER (built
 from the resolved parent run id) so the foreman's step-gated state machine works
@@ -115,9 +117,13 @@ without each subagent skill hardcoding the foreman's id: it tells the child to
 message the foreman on STEP COMPLETION (after it applies the next gate label),
 to route any Slack-door gating ask through the foreman as a `RELAY:` message
 (children cannot post to the chat platform - only the foreman can speak in the
-originating chat thread), to post Jira-door asks itself via scripts/tracker,
-and to simply end if agent-to-agent messaging is unavailable (the foreman then
-advances off the ticket's gate label).
+originating chat thread), to also send a structured `human_input_required` /
+`spec_alignment_required` pause payload when alignment answers are needed so
+the foreman can resume the original child with answers, to post Jira-door asks
+itself via scripts/tracker, and — if agent-to-agent messaging is unavailable —
+to end a completing step after applying its gate label, while a paused step,
+just end without applying any label (the foreman then advances off durable
+ticket signals / the gate label only for completed steps).
 
 Computer use is ENABLED by default on every dispatched child
 (remote.computer_use_enabled=true in the emitted payload). The `run_agents` tool
@@ -147,19 +153,21 @@ PLACEHOLDER = "REPLACE_ME"
 # The per-track standing playbook lives next to the track's config.json.
 AGENTS_MD_FILENAME = "AGENTS.md"
 
-# Prepended (with the track's AGENTS.md text) to the child brief so the child
-# reads its standing track playbook before the foreman's specific task brief.
-# Emitted as the shared run_agents base_prompt.
-TRACK_AGENTS_MD_HEADER = (
-    "# Track playbook - {track}/AGENTS.md\n"
-    "This is the standing playbook for your track. Read it first, then act on "
-    "the task brief that follows.\n\n"
+# Short pointer base_prompt when the track has an AGENTS.md. Names both the
+# playbook path and entry skill path as absolute paths rooted at REPO_ROOT, so
+# the child can read them without searching. A short fallback hint handles the
+# rare case where the checkout is at a different absolute path.
+POINTER_BASE_PROMPT = (
+    "You are the factory {track} child step dispatched by the foreman. "
+    "Read your track playbook at `{agents_md_path}` and your entry skill at "
+    "`{skill_path}` first, then act on the task brief that follows. "
+    "If a path is not present, locate the factory-agents checkout in your workspace."
 )
-# Fallback base_prompt when the track has no AGENTS.md playbook: still point the
-# child at its attached entry skill so dispatch works without a playbook.
+# Fallback base_prompt when the track has no AGENTS.md. Points the child at
+# its entry skill by absolute path so it can find and read it.
 FALLBACK_BASE_PROMPT = (
     "You are the factory {track} child step dispatched by the foreman. Read and "
-    "follow your attached entry skill, then act on the task brief that follows."
+    "follow your entry skill at `{skill_path}`, then act on the task brief that follows."
 )
 
 # Appended to every child brief (when a parent run id is resolved) so the
@@ -175,24 +183,29 @@ COORDINATION_FOOTER = (
     "result, the artifacts you created (tracker issue / spec PR / PR / "
     "review links + your Oz run link), and the gate label you applied, "
     "then end your turn. If your step instead **pauses for required human "
-    "input** (a clarifying question, spec approval, or any other gating ask): "
-    "you CANNOT post to the chat platform yourself - only the foreman can "
-    "speak in the originating chat thread (e.g. the Slack thread), so never "
-    "attempt to post there or hunt for a way in. On a **Slack-door** task, "
-    "send the foreman a relay message instead (agent-to-agent, to the run id "
-    "above) with the subject prefixed `RELAY:` and a body containing the "
-    "exact, ready-to-post text of the ask (Slack mrkdwn, written for a "
-    "stranger); the foreman posts it to the thread verbatim and forwards the "
-    "human's reply back to you as a message that resumes you. On a "
-    "**Jira-door** task, post the ask yourself as a Jira comment via "
-    "`scripts/tracker`. Either way, record the durable content on the ticket "
-    "and end your turn. A `RELAY:` message is NOT a completion report - the "
-    "step is still incomplete and the foreman keeps waiting; send the "
-    "completion message only once the step actually completes. If "
-    "agent-to-agent messaging is unavailable, post the ask as a ticket "
-    "comment noting the conversation channel was unreachable, and end; on "
-    "completion just end after applying the label - the foreman advances off "
-    "the ticket's gate label."
+    "input** (grill-me alignment answers needed, a clarifying question, spec "
+    "approval, or any other gating ask): you CANNOT post to the chat platform "
+    "yourself - only the foreman can speak in the originating chat thread "
+    "(e.g. the Slack thread), so never attempt to post there or hunt for a way "
+    "in. On a **Slack-door** task, send the foreman a relay message instead "
+    "(agent-to-agent, to the run id above) with the subject prefixed `RELAY:` "
+    "and a body containing the exact, ready-to-post text of the ask (Slack "
+    "mrkdwn, written for a stranger); the foreman posts it to the thread "
+    "verbatim and forwards the human's reply back to you as a message that "
+    "resumes you. On a **Jira-door** task, post the ask yourself as a Jira "
+    "comment via `scripts/tracker`. For structured alignment pauses (spec "
+    "grill-me), also send exactly one `human_input_required` / "
+    "`spec_alignment_required` message to the foreman with the ask, your "
+    "task_id, your track name, requester, originating_thread, full question "
+    "objects, and your run link so the foreman can pair answers on resume. "
+    "Either way, record the durable content on the ticket and end your turn "
+    "without reporting completion. A `RELAY:` / alignment pause message is NOT "
+    "a completion report - the step is still incomplete and the foreman keeps "
+    "waiting; send the completion message only once the step actually "
+    "completes. If agent-to-agent messaging is unavailable: a completing step "
+    "ends after applying its gate label (the foreman advances off the ticket's "
+    "gate label); a paused step, just end without applying any label or "
+    "producing artifacts (the foreman polls durable ticket signals and waits)."
 )
 
 # Only used to derive the Oz web origin for the child's run link (no API call is
@@ -245,42 +258,41 @@ def _agents_md_path(track):
     return os.path.join(AGENTS_DIR, track, AGENTS_MD_FILENAME)
 
 
-def _load_track_agents_md(track):
-    """Load the track's AGENTS.md playbook text, or None if absent/empty.
+def _skill_path_for_prompt(skill):
+    """Return an absolute path for a skill spec the child can read directly.
 
-    This is the standing per-track playbook that lives next to the track's
-    config.json (<track>/AGENTS.md). It is prepended to every child brief
-    so the child gets its full track role/playbook in addition to the foreman's
-    brief handoff. A missing/empty file is a non-fatal warning: the brief alone
-    still dispatches. A read error fails loud.
+    For a repo-qualified spec like
+    <org>/<repo>:triage/.agents/skills/factory-triage/SKILL.md, returns an
+    absolute path rooted at REPO_ROOT so the child can open it without knowing
+    its working directory (e.g. <checkout>/triage/.agents/skills/
+    factory-triage/SKILL.md). For a bare name or plain path (no colon),
+    returns the value unchanged.
     """
-    path = _agents_md_path(track)
-    if not os.path.isfile(path):
-        _warn(f"no AGENTS.md for track {track!r}: expected {path}")
-        return None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            text = fh.read().strip()
-    except OSError as e:
-        _die(f"could not read {track} AGENTS.md {path}: {e}")
-    if not text:
-        _warn(f"{track} AGENTS.md {path} is empty")
-        return None
-    return text
+    if ":" in skill:
+        return os.path.join(REPO_ROOT, skill.split(":", 1)[1])
+    return skill
 
 
-def _build_base_prompt(track):
-    """Build the shared run_agents base_prompt from the track's AGENTS.md.
+def _build_base_prompt(track, skill):
+    """Build the shared run_agents base_prompt for the track.
 
-    The base_prompt is prepended to every child prompt by the run_agents tool, so
-    it carries the standing track playbook. When no AGENTS.md is available, fall
-    back to a minimal lead-in that still points the child at its attached entry
-    skill so dispatch works without a playbook.
+    Emits a short pointer naming the track playbook path and entry skill path
+    as absolute paths rooted at REPO_ROOT. Absolute paths let the child read
+    the files immediately without knowing its working directory. Children
+    inherit the foreman's environment and checkout layout, so REPO_ROOT is the
+    same path for both. The full AGENTS.md body is never inlined. When no
+    AGENTS.md is present, the pointer names only the entry skill.
     """
-    agents_md = _load_track_agents_md(track)
-    if not agents_md:
-        return FALLBACK_BASE_PROMPT.format(track=track)
-    return TRACK_AGENTS_MD_HEADER.format(track=track) + agents_md
+    entry = _skill_path_for_prompt(skill)
+    agents_md = _agents_md_path(track)
+    if os.path.isfile(agents_md):
+        return POINTER_BASE_PROMPT.format(
+            track=track,
+            agents_md_path=agents_md,
+            skill_path=entry,
+        )
+    _warn(f"no AGENTS.md for track {track!r}: expected {agents_md}")
+    return FALLBACK_BASE_PROMPT.format(track=track, skill_path=entry)
 
 
 def _derive_skill(track, config):
@@ -537,8 +549,8 @@ def _build_child_prompt(prompt, parent_run_id):
 
     The coordination footer is only added when a parent run id is resolved so the
     child knows which run to report completion to. Without a parent run id the
-    footer would name no foreman, so it is omitted. The track playbook is NOT
-    included here — it is emitted separately as the shared base_prompt.
+    footer would name no foreman, so it is omitted. The playbook / entry-skill
+    pointer is NOT included here — it is emitted as the shared base_prompt.
     """
     if not parent_run_id:
         return prompt
@@ -561,7 +573,6 @@ def _resolve_api_url(flag):
 
 
 def _build_run_agents_payload(
-    skill,
     base_prompt,
     child_prompt,
     model,
@@ -575,8 +586,11 @@ def _build_run_agents_payload(
 
     The foreman calls the run_agents tool with this payload verbatim (a single
     agent_run_configs entry for a single-child dispatch). Run-wide fields
-    (skills, model_id, remote) are shared; the per-child prompt carries the task
+    (model_id, remote) are shared; the per-child prompt carries the task
     brief + coordination footer.
+
+    The entry skill is named in base_prompt so the child reads and follows it
+    from its environment checkout; the payload omits `skills`.
     """
     remote = {"computer_use_enabled": computer_use_enabled}
     if environment_id:
@@ -593,7 +607,6 @@ def _build_run_agents_payload(
             f"Dispatch the factory {track} child step for the current request."
         ),
         "base_prompt": base_prompt,
-        "skills": [{"spec": skill}],
         "remote": remote,
         "agent_run_configs": [agent_run_config],
     }
@@ -665,9 +678,9 @@ def main():
         required=True,
         help=(
             "The task brief handed to the child run (verbatim request + "
-            "context). The track's <track>/AGENTS.md playbook is emitted "
-            "as the shared base_prompt and the coordination footer is appended "
-            "to the per-child prompt."
+            "context). The shared base_prompt points the child at the track's "
+            "<track>/AGENTS.md playbook and entry skill by absolute path, and "
+            "the coordination footer is appended to the per-child prompt."
         ),
     )
     parser.add_argument(
@@ -783,10 +796,9 @@ def main():
         )
     api_url = _resolve_api_url(args.api_url)
     oz_web_origin = _oz_web_origin(api_url)
-    base_prompt = _build_base_prompt(args.track)
+    base_prompt = _build_base_prompt(args.track, skill)
     child_prompt = _build_child_prompt(args.prompt, parent_run_id)
     run_agents = _build_run_agents_payload(
-        skill,
         base_prompt,
         child_prompt,
         model,

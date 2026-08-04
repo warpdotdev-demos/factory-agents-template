@@ -47,10 +47,12 @@ implementation** just like every other hop — there is no user approval gate
 **Spec approval is configurable.** Read `spec_approval_required` from
 `foreman/config.json`. When `true` (the default), the spec child pauses for
 human approval in the conversation before applying `spec-done` — that pause is
-child-owned; you just keep waiting. When `false`, the spec child commits the
-spec and applies `spec-done` immediately with **no human pause** — expect the
-spec step to complete without any approval exchange, and verify only the spec
-PR link as the companion signal.
+child-owned; you just keep waiting (on a Slack-door task the child `RELAY:`s the
+ask, you post it, and you stay in the wait loop so the thread reply can inject
+live and be forwarded). When `false`, the spec child commits the spec and applies
+`spec-done` immediately with **no human pause** — expect the spec step to complete
+without any approval exchange, and verify only the spec PR link as the companion
+signal.
 
 ## Step 0 — Route by the issue's gate label (gating wins)
 
@@ -368,10 +370,12 @@ id explicitly is the safe path.
 It prints JSON
 `{"track","skill","model","name","environment_id","computer_use_enabled","parent_run_id","oz_web_origin","run_link_template","run_agents"}`
 (`name` is the auto-generated `FA_<track>_<timestamp>` run name). The
-`run_agents` field is the ready-to-use tool payload (`summary`, `base_prompt` =
-the track playbook, `skills`, `model_id`, `remote` with `computer_use_enabled` +
-`environment_id`, and a single `agent_run_configs` entry with the child `name`,
-`title`, and the task brief + coordination footer as its `prompt`).
+`run_agents` field is the ready-to-use tool payload (`summary`, `base_prompt` = a
+short pointer naming the track playbook + entry skill by absolute checkout path,
+`model_id`, `remote` with `computer_use_enabled` + `environment_id`, and a single
+`agent_run_configs` entry with the child `name`, `title`, and the task brief +
+coordination footer as its `prompt`). The payload deliberately omits `skills` —
+the child reads its entry skill from the path named in `base_prompt`.
 
 Step B — **dispatch** by calling the `run_agents` tool with the emitted
 `run_agents` payload verbatim (do not hand-assemble it or hit any API). Read the
@@ -417,9 +421,11 @@ confirmed done:
 1. **Drain before every wait.** First call `list_messages_from_agents` to list
    the inbox, then `read_messages_from_agents` on anything pending. **If there is
    any message from the child** (its `agent_id`), do **not** call `wait_for_events`
-   — read it and act on it: a `RELAY:`-subject message is a delivery request, not
-   a completion — handle it per **Relay messages** below and keep waiting; any
-   other child message is its step report — proceed to verification.
+   — read it and act on it: a `RELAY:`-subject message or a structured
+   `spec_alignment_required` / `human_input_required` payload is a delivery /
+   pause request, not a completion — handle it per **Relay messages** /
+   **Structured alignment pause** below and **keep waiting**; any other child
+   message is its step report — proceed to verification.
 2. **Wait only on an empty inbox.** Only when no message from the child is
    pending do you call `wait_for_events` to block for the next inbound event.
 3. **Re-drain on every return.** Each time `wait_for_events` returns — including
@@ -431,22 +437,35 @@ confirmed done:
 **Relay messages (`RELAY:`) are delivery requests, not completions.** A child
 on a Slack-door task cannot post to the Slack thread itself — only you can (see
 **Who can post where** in `factory-tracker-ops`) — so it delivers any
-within-step gating ask (a clarifying question, the spec approval ask, a
-GitHub-username ask) to you as an agent-to-agent message whose subject starts
-with `RELAY:`. When one arrives during the wait:
-1. **Post the message body to the task's Slack thread verbatim.** It arrives
-   pre-formatted in Slack mrkdwn, written for a stranger — do not rewrite it,
-   summarize it, or answer it yourself, and do **not** treat it as the step's
-   completion.
-2. **Keep waiting** — the step is still in flight; re-enter the drain-then-wait
-   loop. Do not apply labels, post a step result, or advance.
-3. **Forward the human's reply.** When the requester answers in the thread, the
-   reply wakes **you**, not the child. Forward the reply verbatim to the paused
-   child via `send_message_to_agent` (its `agent_id`), then resume the
-   drain-then-wait loop until the child reports step completion.
-If a `RELAY:` message arrives for a Jira-door task (the child should have
-posted the Jira comment itself), still deliver it — post it as a Jira comment
-via `scripts/tracker comment` — and keep waiting.
+within-step gating ask (grill-me alignment questions, a clarifying question, the
+spec approval ask, a GitHub-username ask) to you as an agent-to-agent message
+whose subject starts with `RELAY:`. When one arrives during the wait:
+1. **Post the message body to the task's conversation channel verbatim** — the
+   Slack thread on a Slack-door task, or a Jira comment via
+   `scripts/tracker comment` if a `RELAY:` arrives on a Jira-door task. It
+   arrives pre-formatted for that door, written for a stranger — do not rewrite
+   it, summarize it, or answer it yourself, and do **not** treat it as the
+   step's completion. On Slack, post it the same way you post other requester-
+   facing updates in this run. If the ask needs a reply, say so clearly in the
+   body.
+2. **Record the child's `agent_id`** (from when you dispatched it) and any
+   structured payload (`spec_alignment_required` / `human_input_required`,
+   including the original `questions` list) so you can forward the human reply
+   to that same child.
+3. **Keep waiting** — the step is still in flight; re-enter the drain-then-wait
+   loop. Do **not** end the foreman turn and do **not** stop the run while a
+   human reply is outstanding. Slack thread replies inject into an **active**
+   foreman conversation, so ending the turn can stop plain replies from landing
+   at all. Do not apply labels, post a step result, or advance. Do not
+   advance any gate label while waiting for the human reply.
+4. **Forward the human's reply live.** When the requester answers in the thread,
+   the reply arrives on **this still-running foreman** (not only as a later
+   cold-start). Forward it via `send_message_to_agent` (to the child's
+   `agent_id`). When the pause was structured (`spec_alignment_required` /
+   `human_input_required`), send an `alignment_answers` block (the requester's
+   replies) paired with the original `alignment_questions` list. The child's
+   Step 1 branch 3 picks up from there. Then resume the drain-then-wait loop
+   until the child reports step completion. Do **not** dispatch a fresh child.
 
 **Bias toward assuming the message was received.** If draining ever surfaces a
 plausible completion signal — a message from the child's `agent_id`, or the durable
@@ -457,11 +476,14 @@ below).
 
 **Respond to user follow-ups promptly.** When a follow-up arrives while you are
 waiting:
-- **Direct asks (scope change, "my GitHub username is X", a factual question)**
-  — act on or answer them directly. If the follow-up answers a child's relayed
-  ask (see **Relay messages** above), forward it verbatim to the paused child
-  via `send_message_to_agent` rather than answering it yourself. No holding
-  message needed; just do the work.
+- **Answers to a paused child's ask** (alignment answers, clarifying-question
+  replies, GitHub username, approval text) — **forward first** via
+  `send_message_to_agent` to the recorded child `agent_id` rather than answering
+  yourself or dispatching a fresh run. For a structured alignment pause, include
+  `alignment_questions` + `alignment_answers`. Then keep waiting for that child.
+- **Direct asks that are not answers to a paused child** (scope change, a new
+  factual question) — act on or answer them directly. No holding message needed;
+  just do the work.
 - **Status checks ("where are you at?", "well?", "still running?")** — if
   checking the answer requires tool calls that will take time, post one line
   first before touching any tools so the user knows you heard them. Example:
@@ -489,14 +511,34 @@ Repeat at most **3 times**.
 **Don't trust the message blindly** — always re-verify the durable signals (new
 gate label + required status/artifact signal) before reporting and advancing.
 
-Within-step human pauses (a clarifying question, or spec approval when
-`spec_approval_required` is `true`) are **child-owned in content but
-foreman-delivered on the Slack door**: the child writes the ask and, on a
-Slack-door task, sends it to you as a `RELAY:` message that you post to the
-thread verbatim (on the Jira door it posts the Jira comment itself). The child
-does *not* message you as complete, so your wait simply continues across that
-pause — you relay the ask, forward the human's thread reply to the paused
-child, and keep waiting until the step completes.
+Within-step human pauses (a clarifying question, grill-me alignment, or spec
+approval when `spec_approval_required` is `true`) are **child-owned in content
+but foreman-delivered on the Slack door**: the child writes the ask and, on a
+Slack-door task, sends it to you as a `RELAY:` message (and may also send a
+structured `spec_alignment_required` / `human_input_required` payload). You post
+the human-facing ask to the conversation channel, **record the child's
+`agent_id`**, and **keep waiting** so the thread reply can inject into this live
+run and be forwarded. On the Jira door the child usually posts the Jira comment
+itself; if it `RELAY:`s instead, you post the comment and keep waiting. Do **not**
+end the foreman turn across a human pause on Slack-door tasks — that is what
+prevented plain thread replies from landing. When the requester answers, resume
+the existing child (see **Relay messages** / **Structured alignment pause**),
+then keep waiting until that child reports completion.
+
+**Structured alignment pause** — when a child sends a message of type
+`spec_alignment_required` or `human_input_required` (often alongside a `RELAY:`
+human-facing ask on the Slack door), treat it as a first-class structured pause
+rather than a completion or generic blocker. Do **not** treat it as step
+completion. **Record the child's `agent_id`** (from when you dispatched it) so
+you can reply to it directly. Post the exact questions from the message payload
+**action-first** to the originating conversation if a `RELAY:` body was not
+already posted, tagging the requester. **Keep waiting.** When the requester
+replies with answers in the conversation, **resume the existing child run** by
+sending it the answers via `send_message_to_agent` (to the child's `agent_id`)
+with an `alignment_answers` block (the requester's replies) paired with the
+original `alignment_questions` list. The child's Step 1 branch 3 picks up from
+there. Do not dispatch a fresh child run. Do not advance any gate label while
+waiting for alignment answers.
 
 ## Step 4 — Report the step result
 
@@ -508,6 +550,15 @@ review), the child's **Oz run link**
 not a shared-session link), the **new gate label**, and the companion
 status/artifact signal you verified (for example, Todo + estimate, spec PR link,
 PR + In Progress, or review + In Review).
+
+**Slack-door delivery.** On a Slack-originated run, post requester-facing
+updates (dispatch notices, step results, human asks) through the same Slack path
+this factory already uses for thread replies. Prefer whatever mechanism keeps the
+foreman run **active** across a human pause so the next thread reply can inject
+live — do **not** end the foreman turn just to deliver a gating ask.
+Use `notify_user` for in-progress status. If your host requires `finish_task`
+for a true terminal hand-off (merge ask / final wrap-up), use it then; do not
+use a terminal finish to deliver a mid-loop alignment/clarifying ask.
 
 **Any ask that gates progress** — spec approval handled by the spec child, a
 `continue` handoff, or the merge ask — must be surfaced **in the task's
@@ -626,20 +677,34 @@ including the move into code-review whether the implementation was a target-repo
 change (`factory-implement`) or a self-skills change (`factory-self-update`):
 both apply `impl-done` and report completion, which immediately triggers the
 auto-dispatch. The only exceptions where you **block on a human** are the merge
-ask, a clarifying question, and an exhausted rework budget (spec approval, when
-required by config, is a within-step pause the spec child owns — you just keep
-waiting). Whenever you block, **surface that ask at the top of the response in
-the task's conversation channel** (per Step 4's action-first format) — on a
-Slack-door task never ask the user to approve or continue via a ticket comment —
-tag the requester, and **end your turn**.
+ask, a clarifying question, a structured alignment / `RELAY:` human-input pause
+from a child, an exhausted rework budget, and (when config requires it) the
+within-step spec-approval pause the spec child owns. Whenever you block,
+**surface that ask at the top of the response in the task's conversation
+channel** (per Step 4's action-first format) — on a Slack-door task never ask the
+user to approve or continue via a ticket comment — tag the requester, and **end
+your turn**. Ending the turn is what lets the conversation reply wake this run;
+for mid-loop Slack human pauses, stay in the wait loop so the reply can inject live; end the turn only for true terminal hand-offs (e.g. merge).
+
+- **Alignment answers received** (requester replied to questions after a
+  `spec_alignment_required` pause) → **resume the existing spec child** by
+  sending it the answers via `send_message_to_agent` (to its `agent_id`)
+  with `alignment_questions` (the original questions from the pause message) and
+  `alignment_answers` (the requester's replies). The spec child's Step 1 branch 3
+  resumes from there. Do not dispatch a new child run. Do not apply any gate
+  label. After forwarding, re-enter the drain-then-wait loop until that child
+  reports step completion.
 
 **Continuation (hybrid).** When the user replies `continue` in the task's
 conversation channel (or sends any follow-up), this skill runs again from
-Step 0: re-read the issue's **gate label** plus companion completion signals and
-dispatch the step they dictate. This works whether the reply resumes this same
-foreman run or starts a fresh foreman — both converge on the durable ticket
-state (a Jira-door reply routinely cold-starts a fresh run that re-derives all
-state from the ticket).
+Step 0 — **unless** the follow-up is clearly the answer to a paused child's
+outstanding ask, in which case handle that resume path first (forward to the
+recorded child `agent_id`, then wait for the child's completion). Otherwise
+re-read the issue's **gate label** plus companion completion signals and dispatch
+the step they dictate. This works whether the reply resumes this same foreman
+run or starts a fresh foreman — both converge on the durable ticket state (a
+Jira-door reply routinely cold-starts a fresh run that re-derives all state from
+the ticket).
 
 **Fallback — no messaging.** If `wait_for_events` / agent-to-agent messaging is
 unavailable in this environment, don't block: after dispatching (Step 2), post
