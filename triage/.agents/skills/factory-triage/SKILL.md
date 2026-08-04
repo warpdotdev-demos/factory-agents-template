@@ -242,8 +242,9 @@ When reproduction is required:
   this runner (e.g. it needs production-only data/infra); note that on the task
   and proceed.
 - **If you can't reproduce it** (and it isn't an environment skip), post a
-  succinct theory for why, then **proceed** — a non-repro is a signal (it pushes
-  toward complex / `triage-done`), not a stop.
+  succinct theory for why, then **proceed** — a non-repro is a signal, not a
+  stop, and is **not by itself** enough to require a spec (see
+  `evaluate-complexity`).
 - **Re-entrancy.** If history shows you already reproduced (or skipped), don't
   redo it.
 
@@ -251,9 +252,10 @@ When reproduction is required:
 
 Apply `evaluate-complexity` to choose triage's local completion outputs — the
 **gate label** to apply and the **story-point estimate** to set (feed in what the
-pre-check and any Step 3 repro showed):
-- **Obvious & safe (or trivial)** → `spec-done` (spec skipped).
-- **Non-obvious / complex** → `triage-done` (requires a written spec artifact).
+pre-check and any Step 3 repro showed). **The default is no spec:**
+- **No spec (the common path)** → `spec-done`, straight to implementation.
+- **Spec (the uncommon path)** → `triage-done`, only when BOTH significant
+  product ambiguity AND material technical complexity are present.
 Choose the estimate using the story-point scale: XS=1, S=2, M=3, L=5, XL=8.
 Small obvious/local changes should be XS/S; ambiguous, cross-cutting, or risky
 work should be M/L/XL. `evaluate-complexity` decides the label and estimate; it

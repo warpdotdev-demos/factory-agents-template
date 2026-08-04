@@ -75,11 +75,13 @@ conversation channel** — the Slack thread for a Slack-triggered task, or a Jir
 comment for a Jira-triggered task — per the door-dependent doctrine in
 `factory-tracker-ops`. **Child agents cannot post to the Slack thread** — on a
 Slack-door task they deliver the ask to the foreman as a `RELAY:` message and
-the foreman posts it verbatim (see **Who can post where** in
-`factory-tracker-ops`). On a Slack-door task, never leave the ask only on the
-ticket: a ticket comment does not wake the run. Write every such ask **for a
-stranger** — include the ticket key, the exact question, and what a valid reply
-looks like, since the reply may cold-start a fresh run.
+the foreman posts it verbatim, records the child's `agent_id`, and **keeps
+waiting** so the human reply can inject into the live foreman run (see **Who can
+post where** and the wait-for-a-human pattern in `factory-tracker-ops`). On a
+Slack-door task, never leave the ask only on the ticket: a ticket comment does
+not wake the run. Write every such ask **for a stranger** — include the ticket
+key, the exact question, and what a valid reply looks like.
+
 
 ## Action-first — lead with the ask
 

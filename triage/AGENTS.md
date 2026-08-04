@@ -48,8 +48,11 @@ that records triage completion (or ask for clarification).
   reply looks like), then **end your turn**; the reply resumes you later (see
   the door-dependent doctrine and **Who can post where** in
   `factory-tracker-ops`).
-- **You decide the path.** Obvious-fix (`spec-done`) vs. needs-a-spec
-  (`triage-done`) is your call — never ask the requester to choose it.
+- **You decide the path.** Straight-to-implementation (`spec-done`) vs.
+  needs-a-spec (`triage-done`) is your call — never ask the requester to choose
+  it. **The default is no spec**; require one sparingly and only when BOTH
+  significant product ambiguity AND material technical complexity are present
+  (per `evaluate-complexity`).
 - **Complete by ticket signals, never by routing.** Triage ends by setting status
   **Todo**, recording a story-point estimate, applying exactly one completion
   label, and stopping; it never invokes sibling step skills directly. Triage is
@@ -79,7 +82,8 @@ that records triage completion (or ask for clarification).
 
 ## Your skills
 - `factory-triage` — entry-point triage owner.
-- `evaluate-complexity` — obvious-and-safe vs. needs-a-spec label decision.
+- `evaluate-complexity` — straight-to-implementation vs. needs-a-spec label
+  decision, defaulting to no spec.
 
 Triage completes by **applying a gate label** (`spec-done` or `triage-done`) per
 `factory-tracker-ops`, setting the ticket status to **Todo**, and recording a

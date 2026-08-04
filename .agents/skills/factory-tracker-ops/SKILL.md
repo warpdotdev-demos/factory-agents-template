@@ -77,10 +77,12 @@ The two doors have different reach for different agents.
   foreman** — send the foreman (the run id in your brief's coordination footer)
   an agent-to-agent message with the subject prefixed `RELAY:` and a body
   containing the exact, ready-to-post Slack-mrkdwn text of the ask (written
-  for a stranger), then end the turn. The foreman posts that text to the
-  thread verbatim. The human's thread reply wakes the **foreman**, which
-  forwards it verbatim to the paused child — that forwarded message is what
-  resumes the child.
+  for a stranger), then end the child's turn. The foreman posts that text to the
+  thread verbatim, **records the child's `agent_id`**, and **keeps waiting** so
+  the human's thread reply can inject into the still-active foreman run. The
+  foreman then forwards the reply verbatim to the paused child — that forwarded
+  message is what resumes the child. Ending the foreman turn mid-pause can stop
+  plain thread replies from landing at all, so keep the run active.
 - **Any agent can post a Jira comment.** Children carry tracker credentials,
   so on a Jira-door task they post gating asks themselves via
   `scripts/tracker comment` — no relay needed.
@@ -557,23 +559,29 @@ clarifying question, spec approval, merge ask, or any `continue`), do this.
 1. **Deliver the ask to the task's conversation channel, by role and door**
    (see **Who can post where** above).
    - **Foreman** — post it directly in the Slack thread on a Slack-door task,
-     or as a Jira comment on a Jira-door task.
+     or as a Jira comment on a Jira-door task. If the ask came from a child's
+     `RELAY:` / structured pause, also **record that child's `agent_id`** so
+     the later reply can resume the same child.
    - **Child agent, Slack door** — you cannot post to the thread; send the
      foreman a `RELAY:` message carrying the exact Slack-mrkdwn text to post,
-     and the foreman posts it verbatim.
+     and the foreman posts it verbatim, records your `agent_id`, and **keeps
+     waiting** (the child ends its own turn after the relay).
    - **Child agent, Jira door** — post the Jira comment yourself via
      `scripts/tracker comment`.
    Whoever authors it, tag the relevant person, tell them to reply there, and
    write the ask **for a stranger** — include the ticket key, the exact
-   question, and what a valid reply looks like, because the reply may
-   cold-start a fresh run that re-derives all state from the ticket. On a
-   Slack-door task, never depend on a ticket comment to resume the workflow;
-   record the durable content the ask refers to (e.g. the spec PR link) on
-   the ticket, but put the request-for-a-reply itself in the thread (via the
-   relay when you are a child).
-2. **End your turn.** The reply resumes the run later — a ticket comment wakes
-   the run on the Jira door; on the Slack door the thread reply wakes the
-   **foreman**, which forwards it to the paused child when the ask was a
-   child's relayed ask. Either way, the agent re-derives external state from
-   the task record + `scripts/factory-state`.
-Don't poll in a loop waiting — it wastes the run.
+   question, and what a valid reply looks like. On a Slack-door task, never
+   depend on a ticket comment to resume the workflow; record the durable content
+   the ask refers to (e.g. the spec PR link) on the ticket, but put the
+   request-for-a-reply itself in the thread (via the relay when you are a child).
+2. **Child ends; foreman keeps waiting on Slack mid-loop pauses.** After a child
+   relays or posts a gating ask, the **child** ends its turn. The **foreman** on
+   a Slack-door mid-loop pause (alignment / clarifying / approval) should **keep
+   its wait loop running** so the thread reply injects into the live run and can
+   be forwarded to the paused child. Do not end the foreman turn just to deliver
+   that ask — doing so can stop plain thread replies from landing at all. A ticket
+   comment wakes the run on the Jira door; on the Slack door the thread reply
+   should land on the still-waiting foreman, which forwards it to the paused
+   child when the ask was a child's relayed ask. Either way, re-derive external
+   state from the task record + `scripts/factory-state` as needed.
+Don't busy-poll in a spin loop — use the normal drain-then-wait pattern.
